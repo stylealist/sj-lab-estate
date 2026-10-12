@@ -1,0 +1,44 @@
+server:
+  # 다른 백엔드와 같게 포트는 0(임의) — 게이트웨이가 Eureka 에서 찾아 부른다.
+  # 직접 확인하고 싶으면 --server.port=8120 으로 띄운다(local-stack.ps1 이 그렇게 띄운다).
+  port: ${SERVER_PORT:0}
+  servlet:
+    context-path: /estate
+  forward-headers-strategy: framework
+  compression:
+    enabled: true
+    mime-types: application/json,text/plain
+    min-response-size: 2KB
+
+spring:
+  application:
+    name: sj-lab-estate
+
+estate:
+  datasource:
+    # 저장소가 public 이라 접속 정보는 환경변수로만 받는다. 로컬은 sj-lab 의
+    # .claude/settings.local.json, 운영은 k8s Secret 에서 넣는다.
+    # **값이 없으면 조회 API 만 503(NOT_CONFIGURED) 이고 /estate/status 는 그대로 응답한다** —
+    # 화면이 "준비되지 않았다"를 사용자에게 알려 줄 수 있어야 하기 때문이다.
+    url: ${ESTATE_DB_URL:}
+    username: ${ESTATE_DB_USERNAME:}
+    password: ${ESTATE_DB_PASSWORD:}
+    pool-size: ${ESTATE_DB_POOL_SIZE:5}
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: false
+    # Map 으로 돌려줄 때 값이 null 인 컬럼도 키를 남긴다. 끄면 키가 아예 빠져
+    # 화면이 "그 항목이 없는 응답"을 받게 된다.
+    call-setters-on-nulls: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  level:
+    com.sjlab.estate: info
