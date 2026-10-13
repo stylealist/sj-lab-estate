@@ -1,6 +1,8 @@
 package com.sjlab.estate.service;
 
 import com.sjlab.estate.mapper.EstateMapper;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -8,6 +10,8 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 
@@ -39,6 +43,24 @@ public class EstateService {
             propertyType("villa", "빌라 · 다가구", false));
 
     private static final Logger log = LoggerFactory.getLogger(EstateService.class);
+
+    /**
+     * 지역 목록 캐시 유지 시간.
+     *
+     * <p>이 조회는 <b>표 전체를 세기 때문에 5초가 걸린다</b>(9.9만→990만 행의 인덱스를 끝까지 읽는다.
+     * 실측 5.1초, Parallel Index Only Scan). 그런데 결과는 <b>수집이 돌 때만</b> 바뀌고 수집은 하루
+     * 한 번이다. 그래서 받아 두고 다시 쓰는 쪽이 맞다 — 첫 화면이 지역 목록 때문에 멈추던 문제가
+     * 이것이었다(2026-10-13).
+     *
+     * <p>건수는 화면 선택 목록의 보조 표시이므로 몇 시간 뒤처져도 문제가 없다.
+     */
+    private static final Duration REGIONS_TTL = Duration.ofHours(6);
+
+    private volatile List<Map<String, Object>> cachedRegions;
+    private volatile Instant regionsLoadedAt;
+    /** 갱신이 겹쳐 같은 무거운 조회를 여러 번 돌리지 않게 한다. */
+    private final java.util.concurrent.atomic.AtomicBoolean regionsRefreshing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private final ObjectProvider<EstateMapper> mapperProvider;
     private final Environment environment;
@@ -175,33 +197,151 @@ public class EstateService {
         return row == null ? null : row.get("last_load");
     }
 
+    /**
+     * 거래가 있는 시군구 목록(시도 코드·이름 포함). 느린 조회라 받아 두고 다시 쓴다.
+     *
+     * <p><b>기한이 지나도 사용자를 기다리게 하지 않는다</b> — 가진 값을 바로 주고 갱신은 뒤에서
+     * 한다(stale-while-revalidate). 만료된 순간에 들어온 사람만 5초를 기다리는 일이 없게 하려는
+     * 것이다. 갱신이 겹치지 않도록 한 번에 하나만 돌린다.
+     */
     public List<Map<String, Object>> getRegions() {
-        return mapper().selectRegions();
+        List<Map<String, Object>> cached = cachedRegions;
+        Instant loadedAt = regionsLoadedAt;
+        boolean fresh = cached != null && loadedAt != null
+                && Instant.now().isBefore(loadedAt.plus(REGIONS_TTL));
+        if (fresh) {
+            return cached;
+        }
+        if (cached != null) {
+            refreshRegionsInBackground();
+            return cached;
+        }
+        return loadRegions();
     }
 
-    public List<Map<String, Object>> getTradeMonthly(String sggCd, Integer fromYm, Integer toYm) {
+    private void refreshRegionsInBackground() {
+        if (!regionsRefreshing.compareAndSet(false, true)) {
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            try {
+                loadRegions();
+            } catch (Exception e) {
+                log.warn("지역 목록 갱신 실패 — 이전 값을 계속 사용한다: {}", e.getClass().getSimpleName());
+            } finally {
+                regionsRefreshing.set(false);
+            }
+        }, "estate-regions-refresh");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** 시군구 건수 + 시도 이름을 합쳐 캐시에 넣는다. */
+    private List<Map<String, Object>> loadRegions() {
         EstateMapper mapper = mapper();
-        if (sggCd != null && !sggCd.isBlank()) {
+        List<Map<String, Object>> rows = mapper.selectRegions();
+
+        // 시도 이름은 17행짜리 표에서 따로 읽어 코드 앞 2자리로 붙인다
+        // (이 조인을 무거운 집계 쿼리에 넣으면 5.1초 → 19.7초가 된다. 2026-10-13 실측)
+        Map<String, String> sidoNames = new LinkedHashMap<>();
+        try {
+            for (Map<String, Object> sido : mapper.selectSidoNames()) {
+                Object code = sido.get("sido_cd");
+                Object name = sido.get("sido_nm");
+                if (code != null) {
+                    sidoNames.put(String.valueOf(code), name == null ? null : String.valueOf(name));
+                }
+            }
+        } catch (RuntimeException e) {
+            // 이름을 못 읽어도 코드로 묶으면 화면은 동작한다(권한 누락 등)
+            log.warn("시도 이름을 읽지 못해 코드로 표시한다: {}", e.getClass().getSimpleName());
+        }
+
+        List<Map<String, Object>> merged = new ArrayList<>(rows.size());
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> item = new LinkedHashMap<>(row);
+            String sggCd = row.get("sgg_cd") == null ? "" : String.valueOf(row.get("sgg_cd"));
+            String sidoCd = sggCd.length() >= 2 ? sggCd.substring(0, 2) : sggCd;
+            String sidoNm = sidoNames.get(sidoCd);
+            item.put("sido_cd", sidoCd);
+            item.put("sido_nm", sidoNm != null ? sidoNm : sidoCd);
+            merged.add(item);
+        }
+
+        cachedRegions = merged;
+        regionsLoadedAt = Instant.now();
+        return merged;
+    }
+
+    /**
+     * 기동 직후 지역 목록을 미리 받아 둔다(예열).
+     *
+     * <p>예열하지 않으면 <b>첫 방문자가 5초를 기다린다.</b> 기다리는 쪽이 사람이 아니라 서버가
+     * 되게 하는 것이 이 메서드의 목적이다. 별도 스레드로 돌려 기동을 늦추지 않고, DB 접속 정보가
+     * 없거나 권한이 없으면 조용히 건너뛴다(그 상태는 /estate/status 가 알려 준다).
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void warmUpRegions() {
+        Thread worker = new Thread(() -> {
+            try {
+                long started = System.currentTimeMillis();
+                int count = getRegions().size();
+                log.info("지역 목록 예열 완료: {}개 ({}ms)", count, System.currentTimeMillis() - started);
+            } catch (Exception e) {
+                log.info("지역 목록 예열 건너뜀: {}", e.getClass().getSimpleName());
+            }
+        }, "estate-regions-warmup");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** 그 시군구의 읍면동 목록. 자연키 인덱스를 타서 빠르므로 캐시하지 않는다(실측 51ms). */
+    public List<Map<String, Object>> getEmdList(String sggCd) {
+        return mapper().selectEmdList(sggCd);
+    }
+
+    /**
+     * 매매 월별 추세. 범위에 따라 읽는 곳이 다르다.
+     *
+     * <ul>
+     *   <li>읍면동까지 고르면 원본에서 계산한다 — 집계 뷰는 시군구 단위로 묶여 있어 쓸 수 없다.</li>
+     *   <li>시군구만 고르면 미리 집계된 뷰를 쓴다(가장 빠르다).</li>
+     *   <li>전국이면 원본에서 월별로 다시 합친다(뷰를 그대로 평균하면 틀린다).</li>
+     * </ul>
+     */
+    public List<Map<String, Object>> getTradeMonthly(String sggCd, String umdNm, Integer fromYm, Integer toYm) {
+        EstateMapper mapper = mapper();
+        boolean hasSgg = sggCd != null && !sggCd.isBlank();
+        if (hasSgg && umdNm != null && !umdNm.isBlank()) {
+            return mapper.selectTradeMonthlyByUmd(sggCd, umdNm, fromYm, toYm);
+        }
+        if (hasSgg) {
             return mapper.selectTradeMonthlyBySgg(sggCd, fromYm, toYm);
         }
         return mapper.selectTradeMonthlyNationwide(fromYm, toYm);
     }
 
-    public List<Map<String, Object>> getRentMonthly(String sggCd, Integer fromYm, Integer toYm) {
+    /** 전월세 월별 추세. 범위에 따라 읽는 곳이 다르다(매매와 같은 규칙). */
+    public List<Map<String, Object>> getRentMonthly(String sggCd, String umdNm, Integer fromYm, Integer toYm) {
         EstateMapper mapper = mapper();
-        if (sggCd != null && !sggCd.isBlank()) {
+        boolean hasSgg = sggCd != null && !sggCd.isBlank();
+        if (hasSgg && umdNm != null && !umdNm.isBlank()) {
+            return mapper.selectRentMonthlyByUmd(sggCd, umdNm, fromYm, toYm);
+        }
+        if (hasSgg) {
             return mapper.selectRentMonthlyBySgg(sggCd, fromYm, toYm);
         }
         return mapper.selectRentMonthlyNationwide(fromYm, toYm);
     }
 
     public List<Map<String, Object>> getTrades(
-            String sggCd, Integer fromYm, Integer toYm, String aptNm, int limit) {
-        return new ArrayList<>(mapper().selectTrades(sggCd, fromYm, toYm, aptNm, limit));
+            String sggCd, String umdNm, Integer fromYm, Integer toYm, String aptNm, int limit) {
+        return new ArrayList<>(mapper().selectTrades(sggCd, umdNm, fromYm, toYm, aptNm, limit));
     }
 
-    public List<Map<String, Object>> getTradeRanking(Integer fromYm, Integer toYm, int limit) {
-        return new ArrayList<>(mapper().selectTradeRanking(fromYm, toYm, limit));
+    /** 지역별 평균 매매가 순위. 시도를 주면 그 시도 안에서만 순위를 낸다. */
+    public List<Map<String, Object>> getTradeRanking(String sidoCd, Integer fromYm, Integer toYm, int limit) {
+        return new ArrayList<>(mapper().selectTradeRanking(sidoCd, fromYm, toYm, limit));
     }
 
     /** DB 접속 설정이 없을 때. 컨트롤러가 503 + NOT_CONFIGURED 로 바꿔 답한다. */

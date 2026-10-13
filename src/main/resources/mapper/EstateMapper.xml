@@ -69,6 +69,13 @@
         where deal_year = #{dealYear} and deal_month = #{dealMonth}
     </select>
 
+    <!--
+      시군구별 거래 건수. 990만 건을 끝까지 세는 조회라 **5초**가 걸린다(서비스가 캐시한다).
+
+      **이름 조인을 여기에 더 넣지 말 것.** 시도 이름까지 조인해 group by 에 넣었더니
+      5.1초 → 19.7초가 됐다(2026-10-13 실측). 이름은 아래 selectSidoNames 로 따로 읽어
+      서비스가 코드 앞 2자리로 붙인다 — 17행이라 비용이 사실상 없다.
+    -->
     <select id="selectRegions" resultType="map">
         select t.sgg_cd,
                coalesce(g.sgg_nm, t.sgg_cd) as sgg_nm,
@@ -77,6 +84,28 @@
         left join public.g_sgg g on g.sgg_cd = t.sgg_cd
         group by t.sgg_cd, g.sgg_nm
         order by coalesce(g.sgg_nm, t.sgg_cd)
+    </select>
+
+    <!-- 시도 코드·이름(17행). 시군구 코드 앞 2자리가 시도 코드다. -->
+    <select id="selectSidoNames" resultType="map">
+        select sido_cd, sido_nm from public.g_sido order by sido_cd
+    </select>
+
+    <!--
+      읍면동 목록. 자연키 유니크 인덱스가 (sgg_cd, umd_nm, ...) 로 시작해 **그 인덱스만 읽고**
+      끝난다(실측 51ms, Index Only Scan). 그래서 캐시하지 않아도 충분히 빠르다.
+
+      **읍면동은 코드가 아니라 이름(umd_nm)으로 가린다.** 매매 표에는 umd_cd 가 있지만
+      전월세 표에는 없어서, 두 표에 공통으로 있는 키는 이름뿐이다. 자연키 인덱스도 이름 기준이다.
+    -->
+    <select id="selectEmdList" resultType="map">
+        select t.umd_nm,
+               count(*) as deal_count
+        from estate.apt_trade t
+        where t.sgg_cd = #{sggCd}
+          and t.umd_nm is not null
+        group by t.umd_nm
+        order by t.umd_nm
     </select>
 
     <!-- 지역을 고르면 미리 집계해 둔 뷰를 쓴다(빠르다). -->
@@ -104,6 +133,49 @@
                round(avg(deal_amount / nullif(exclu_use_ar, 0)), 1)     as avg_amount_per_m2
         from estate.apt_trade
         where deal_amount is not null
+        <include refid="ymFilter"><property name="alias" value=""/></include>
+        group by deal_year, deal_month
+        order by ym
+    </select>
+
+    <!--
+      읍면동까지 좁힌 매매 추세. 집계 뷰(v_apt_trade_monthly)는 **시군구 단위**로 묶여 있어
+      동 단위로는 쓸 수 없으므로 원본에서 계산한다. (sgg_cd, umd_nm) 으로 자연키 인덱스를 타서
+      한 동이면 수 ms 다(실측 3ms).
+    -->
+    <select id="selectTradeMonthlyByUmd" resultType="map">
+        select deal_year, deal_month,
+               deal_year * 100 + deal_month as ym,
+               count(*)                                                as deal_count,
+               round(avg(deal_amount))                                 as avg_amount,
+               percentile_cont(0.5) within group (order by deal_amount) as median_amount,
+               min(deal_amount)                                        as min_amount,
+               max(deal_amount)                                        as max_amount,
+               round(avg(exclu_use_ar), 2)                             as avg_area,
+               round(avg(deal_amount / nullif(exclu_use_ar, 0)), 1)     as avg_amount_per_m2
+        from estate.apt_trade
+        where sgg_cd = #{sggCd}
+          and umd_nm = #{umdNm}
+          and deal_amount is not null
+        <include refid="ymFilter"><property name="alias" value=""/></include>
+        group by deal_year, deal_month
+        order by ym
+    </select>
+
+    <!-- 읍면동까지 좁힌 전월세 추세. 전세·월세 구분은 monthly_rent = 0 (다른 조회와 같은 기준). -->
+    <select id="selectRentMonthlyByUmd" resultType="map">
+        select deal_year, deal_month,
+               deal_year * 100 + deal_month as ym,
+               count(*)                                                             as deal_count,
+               count(*) filter (where coalesce(monthly_rent, 0) = 0)                 as jeonse_count,
+               count(*) filter (where coalesce(monthly_rent, 0) &gt; 0)              as wolse_count,
+               round(avg(deposit) filter (where coalesce(monthly_rent, 0) = 0))      as avg_jeonse_deposit,
+               round(avg(deposit) filter (where coalesce(monthly_rent, 0) &gt; 0))   as avg_wolse_deposit,
+               round(avg(monthly_rent) filter (where coalesce(monthly_rent, 0) &gt; 0)) as avg_monthly_rent,
+               round(avg(exclu_use_ar), 2)                                          as avg_area
+        from estate.apt_rent
+        where sgg_cd = #{sggCd}
+          and umd_nm = #{umdNm}
         <include refid="ymFilter"><property name="alias" value=""/></include>
         group by deal_year, deal_month
         order by ym
@@ -153,6 +225,9 @@
             and t.sgg_cd = #{sggCd}
         </if>
         <include refid="ymFilter"><property name="alias" value="t."/></include>
+        <if test="umdNm != null and umdNm != ''">
+            and t.umd_nm = #{umdNm}
+        </if>
         <if test="aptNm != null and aptNm != ''">
             and t.apt_nm ilike '%' || #{aptNm} || '%'
         </if>
@@ -170,6 +245,10 @@
         from estate.apt_trade t
         left join public.g_sgg g on g.sgg_cd = t.sgg_cd
         where t.deal_amount is not null
+        <if test="sidoCd != null and sidoCd != ''">
+            <!-- 앞 2자리로 자르면(substring) 인덱스를 못 타므로 코드 범위로 좁힌다 -->
+            and t.sgg_cd between #{sidoCd} || '000' and #{sidoCd} || '999'
+        </if>
         <include refid="ymFilter"><property name="alias" value="t."/></include>
         group by t.sgg_cd, g.sgg_nm
         having count(*) &gt;= 10

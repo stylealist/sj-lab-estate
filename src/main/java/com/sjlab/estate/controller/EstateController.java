@@ -64,68 +64,89 @@ public class EstateController {
         return estateService.getMeta();
     }
 
+    /** 시군구 목록. 항목마다 시도 코드·이름이 함께 있어 화면이 시도 목록도 이 응답으로 만든다. */
     @GetMapping("/{propertyType}/regions")
     public Map<String, Object> regions(@PathVariable String propertyType) {
         checkPropertyType(propertyType);
         return items(estateService.getRegions());
     }
 
+    /** 그 시군구의 읍면동 목록. 시군구를 고른 뒤 다음 단계를 그릴 때 부른다. */
+    @GetMapping("/{propertyType}/regions/emd")
+    public Map<String, Object> emdList(
+            @PathVariable String propertyType, @RequestParam String sggCd) {
+        checkPropertyType(propertyType);
+        checkSggCd(sggCd);
+        if (sggCd == null || sggCd.isBlank()) {
+            throw new BadRequestException("MISSING_PARAMETER", "sggCd 는 필수입니다(숫자 5자리).");
+        }
+        return items(estateService.getEmdList(sggCd));
+    }
+
     @GetMapping("/{propertyType}/trade/monthly")
     public Map<String, Object> tradeMonthly(
             @PathVariable String propertyType,
             @RequestParam(required = false) String sggCd,
+            @RequestParam(required = false) String umdNm,
             @RequestParam(required = false) Integer fromYm,
             @RequestParam(required = false) Integer toYm) {
         checkPropertyType(propertyType);
         checkSggCd(sggCd);
+        checkUmdNm(sggCd, umdNm);
         checkYm(fromYm, "fromYm");
         checkYm(toYm, "toYm");
-        return items(estateService.getTradeMonthly(sggCd, fromYm, toYm));
+        return items(estateService.getTradeMonthly(sggCd, umdNm, fromYm, toYm));
     }
 
     @GetMapping("/{propertyType}/rent/monthly")
     public Map<String, Object> rentMonthly(
             @PathVariable String propertyType,
             @RequestParam(required = false) String sggCd,
+            @RequestParam(required = false) String umdNm,
             @RequestParam(required = false) Integer fromYm,
             @RequestParam(required = false) Integer toYm) {
         checkPropertyType(propertyType);
         checkSggCd(sggCd);
+        checkUmdNm(sggCd, umdNm);
         checkYm(fromYm, "fromYm");
         checkYm(toYm, "toYm");
-        return items(estateService.getRentMonthly(sggCd, fromYm, toYm));
+        return items(estateService.getRentMonthly(sggCd, umdNm, fromYm, toYm));
     }
 
     @GetMapping("/{propertyType}/trade")
     public Map<String, Object> trades(
             @PathVariable String propertyType,
             @RequestParam(required = false) String sggCd,
+            @RequestParam(required = false) String umdNm,
             @RequestParam(required = false) Integer fromYm,
             @RequestParam(required = false) Integer toYm,
             @RequestParam(required = false) String aptNm,
             @RequestParam(required = false) Integer limit) {
         checkPropertyType(propertyType);
         checkSggCd(sggCd);
+        checkUmdNm(sggCd, umdNm);
         checkYm(fromYm, "fromYm");
         checkYm(toYm, "toYm");
         if (aptNm != null && aptNm.length() > 100) {
             throw new BadRequestException("INVALID_PARAMETER", "aptNm 은 100자 이하여야 합니다.");
         }
         int size = clamp(limit, EstateService.LIST_LIMIT_DEFAULT, 1, EstateService.LIST_LIMIT_MAX, "limit");
-        return items(estateService.getTrades(sggCd, fromYm, toYm, aptNm, size));
+        return items(estateService.getTrades(sggCd, umdNm, fromYm, toYm, aptNm, size));
     }
 
     @GetMapping("/{propertyType}/trade/ranking")
     public Map<String, Object> tradeRanking(
             @PathVariable String propertyType,
+            @RequestParam(required = false) String sidoCd,
             @RequestParam(required = false) Integer fromYm,
             @RequestParam(required = false) Integer toYm,
             @RequestParam(required = false) Integer limit) {
         checkPropertyType(propertyType);
+        checkSidoCd(sidoCd);
         checkYm(fromYm, "fromYm");
         checkYm(toYm, "toYm");
         int size = clamp(limit, 20, 1, 100, "limit");
-        return items(estateService.getTradeRanking(fromYm, toYm, size));
+        return items(estateService.getTradeRanking(sidoCd, fromYm, toYm, size));
     }
 
     /** 목록 응답은 {@code {"items": [...]}} 로 감싼다(옛 구현과 같은 형태). */
@@ -152,6 +173,30 @@ public class EstateController {
     private void checkSggCd(String sggCd) {
         if (sggCd != null && !sggCd.isBlank() && !sggCd.matches("\\d{5}")) {
             throw new BadRequestException("INVALID_PARAMETER", "sggCd 는 숫자 5자리입니다(예: 11680).");
+        }
+    }
+
+    private void checkSidoCd(String sidoCd) {
+        if (sidoCd != null && !sidoCd.isBlank() && !sidoCd.matches("\\d{2}")) {
+            throw new BadRequestException("INVALID_PARAMETER", "sidoCd 는 숫자 2자리입니다(예: 11).");
+        }
+    }
+
+    /**
+     * 읍면동은 **이름**으로 받는다(두 표에 공통으로 있는 키가 이름뿐이다).
+     *
+     * <p>시군구 없이 읍면동만 주면 같은 이름이 전국에 여러 개 있어 엉뚱한 결과가 나오므로 400 이다.
+     */
+    private void checkUmdNm(String sggCd, String umdNm) {
+        if (umdNm == null || umdNm.isBlank()) {
+            return;
+        }
+        if (sggCd == null || sggCd.isBlank()) {
+            throw new BadRequestException(
+                    "MISSING_PARAMETER", "umdNm 을 쓸 때는 sggCd 도 함께 주세요(같은 동 이름이 여러 지역에 있습니다).");
+        }
+        if (umdNm.length() > 40) {
+            throw new BadRequestException("INVALID_PARAMETER", "umdNm 은 40자 이하여야 합니다.");
         }
     }
 

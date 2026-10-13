@@ -19,13 +19,16 @@ sj-lab-estate-web → sj-lab-apigateway(/estate/**) → sj-lab-estate → Postgr
 |---|---|
 | `GET /estate/status` | 사용 가능 여부와 매물 종류 목록(아파트 · 오피스텔 · 빌라) |
 | `GET /estate/{종류}/meta` | 건수(추정)·수집 기간·마지막 적재 시각 |
-| `GET /estate/{종류}/regions` | 거래가 있는 시군구(코드 · 이름 · 건수) |
+| `GET /estate/{종류}/regions` | 거래가 있는 시군구(코드 · 이름 · 건수 + 시도 코드 · 이름) |
+| `GET /estate/{종류}/regions/emd?sggCd=` | 그 시군구의 읍면동(이름 · 건수) |
 | `GET /estate/{종류}/trade/monthly` | 매매 월별 건수·평균·중위·최저·최고·㎡당 |
 | `GET /estate/{종류}/rent/monthly` | 전월세 월별 전세/월세 건수와 평균 보증금·월세 |
 | `GET /estate/{종류}/trade` | 매매 거래 목록(최근 계약일 순, 단지명 부분 검색) |
 | `GET /estate/{종류}/trade/ranking` | 기간 내 시군구 평균 매매가 순위 |
 
-공통 질의 파라미터는 `sggCd`(숫자 5자리) · `fromYm` · `toYm`(yyyyMM) · `limit` 입니다.
+공통 질의 파라미터는 `sggCd`(숫자 5자리) · `umdNm`(읍면동 **이름**) · `fromYm` · `toYm`(yyyyMM) · `limit` 입니다.
+순위는 `sidoCd`(숫자 2자리)로 그 시도 안에서만 낼 수 있습니다. `umdNm` 은 `sggCd` 와 함께 주세요
+(같은 동 이름이 여러 지역에 있어 단독으로는 400입니다).
 금액 단위는 원천 그대로 **만원**이고, 억/만원 표기는 화면이 합니다.
 
 ```bash
@@ -71,6 +74,7 @@ java -jar target\sj-lab-estate.jar --spring.profiles.active=local --server.port=
 | 요약(meta) | 32초 | 0.1초 | `max(created_at)` 전건 스캔 → 최근 거래 월로 범위를 좁힘 |
 | 지역 순위 | 23.5초 | 1.5초 | 기간을 `연*100+월` **식**으로 비교해 인덱스 미사용 → 연도 범위로 바꿈 |
 | 지역 1곳 추세 | — | 0.04초 | 집계 뷰 사용 |
+| 지역 목록 | 6.4초 | 0.04초 | 전체를 세는 조회라 느림 → 6시간 캐시 + 기동 시 예열(첫 방문자가 기다리지 않게) |
 | 전국 추세 | 8.6초(매매) · 28.7초(전월세) | — | 평균·중위 때문에 금액·면적을 실제로 읽어야 함(미리 집계하면 해결) |
 
 건수는 `count(*)` 가 아니라 통계 추정치를 쓰고 응답에 `rows_estimated: true` 로 밝힙니다.

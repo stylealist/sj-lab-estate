@@ -36,8 +36,14 @@ public interface EstateMapper {
             @Param("dealYear") int dealYear,
             @Param("dealMonth") int dealMonth);
 
-    /** 거래가 있는 시군구 목록(코드 · 이름 · 건수). */
+    /** 거래가 있는 시군구 목록(코드 · 이름 · 건수). 시도 이름은 아래 조회로 따로 붙인다. */
     List<Map<String, Object>> selectRegions();
+
+    /** 시도 코드·이름(17행). 시군구 코드 앞 2자리로 이어 붙인다. */
+    List<Map<String, Object>> selectSidoNames();
+
+    /** 그 시군구 안에서 거래가 있는 읍면동 목록(이름 · 건수). */
+    List<Map<String, Object>> selectEmdList(@Param("sggCd") String sggCd);
 
     /** 매매 월별 추세 — 지역을 고르면 집계 뷰, 전국이면 원본에서 다시 합친다. */
     List<Map<String, Object>> selectTradeMonthlyBySgg(
@@ -46,6 +52,13 @@ public interface EstateMapper {
     List<Map<String, Object>> selectTradeMonthlyNationwide(
             @Param("fromYm") Integer fromYm, @Param("toYm") Integer toYm);
 
+    /** 읍면동까지 좁힌 매매 추세(집계 뷰는 시군구 단위라 쓸 수 없다). */
+    List<Map<String, Object>> selectTradeMonthlyByUmd(
+            @Param("sggCd") String sggCd,
+            @Param("umdNm") String umdNm,
+            @Param("fromYm") Integer fromYm,
+            @Param("toYm") Integer toYm);
+
     /** 전월세 월별 추세(전세 = 월세가 0). */
     List<Map<String, Object>> selectRentMonthlyBySgg(
             @Param("sggCd") String sggCd, @Param("fromYm") Integer fromYm, @Param("toYm") Integer toYm);
@@ -53,9 +66,17 @@ public interface EstateMapper {
     List<Map<String, Object>> selectRentMonthlyNationwide(
             @Param("fromYm") Integer fromYm, @Param("toYm") Integer toYm);
 
+    /** 읍면동까지 좁힌 전월세 추세. */
+    List<Map<String, Object>> selectRentMonthlyByUmd(
+            @Param("sggCd") String sggCd,
+            @Param("umdNm") String umdNm,
+            @Param("fromYm") Integer fromYm,
+            @Param("toYm") Integer toYm);
+
     /** 매매 거래 목록(최근 계약일 순). */
     List<Map<String, Object>> selectTrades(
             @Param("sggCd") String sggCd,
+            @Param("umdNm") String umdNm,
             @Param("fromYm") Integer fromYm,
             @Param("toYm") Integer toYm,
             @Param("aptNm") String aptNm,
@@ -63,5 +84,8 @@ public interface EstateMapper {
 
     /** 지역별 평균 매매가 순위(거래 10건 이상인 지역만). */
     List<Map<String, Object>> selectTradeRanking(
-            @Param("fromYm") Integer fromYm, @Param("toYm") Integer toYm, @Param("limit") int limit);
+            @Param("sidoCd") String sidoCd,
+            @Param("fromYm") Integer fromYm,
+            @Param("toYm") Integer toYm,
+            @Param("limit") int limit);
 }
