@@ -36,7 +36,10 @@ public class EstateController {
     /** 화면이 "데이터를 쓸 수 있는 상태인지" 확인할 때 쓴다. 설정이 없어도 부를 수 있다. */
     @GetMapping("/status")
     public Map<String, Object> status() {
-        boolean ready = estateService.isReady();
+        Map<String, Object> readiness = estateService.readiness();
+        String reason = String.valueOf(readiness.get("reason"));
+        boolean ready = "READY".equals(reason);
+
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ready", ready);
         body.put(
@@ -44,6 +47,13 @@ public class EstateController {
                 ready
                         ? "부동산 실거래 데이터를 조회할 수 있습니다."
                         : "부동산 데이터 접속이 준비되지 않았습니다.");
+        // 준비되지 않은 이유를 함께 알려 준다 — "설정이 없다"와 "붙지 못한다"를 구분하지 못하면
+        // 운영에서 무엇을 고쳐야 할지 알 수 없다. 접속 문자열·비밀번호는 담지 않는다.
+        body.put("reason", reason);
+        body.put("configured", readiness.get("configured"));
+        if (readiness.get("detail") != null) {
+            body.put("detail", readiness.get("detail"));
+        }
         body.put("propertyTypes", estateService.propertyTypes());
         return body;
     }

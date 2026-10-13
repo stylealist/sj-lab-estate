@@ -5,7 +5,10 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 
 /**
@@ -35,10 +38,14 @@ public class EstateService {
             propertyType("offi", "오피스텔", false),
             propertyType("villa", "빌라 · 다가구", false));
 
-    private final ObjectProvider<EstateMapper> mapperProvider;
+    private static final Logger log = LoggerFactory.getLogger(EstateService.class);
 
-    public EstateService(ObjectProvider<EstateMapper> mapperProvider) {
+    private final ObjectProvider<EstateMapper> mapperProvider;
+    private final Environment environment;
+
+    public EstateService(ObjectProvider<EstateMapper> mapperProvider, Environment environment) {
         this.mapperProvider = mapperProvider;
+        this.environment = environment;
     }
 
     private static Map<String, Object> propertyType(String id, String label, boolean available) {
@@ -50,7 +57,49 @@ public class EstateService {
     }
 
     public boolean isReady() {
-        return mapperProvider.getIfAvailable() != null;
+        return "READY".equals(readiness().get("reason"));
+    }
+
+    /**
+     * 조회가 가능한 상태인지와 <b>아닐 때의 이유</b>를 돌려준다.
+     *
+     * <p>왜 이유까지 담는가: 운영에서 화면이 "준비되지 않았다"만 보여 주면 접속 정보가 없는 것인지,
+     * 있는데 DB 에 못 붙는 것인지 구분할 수 없어 확인이 느려진다(2026-10-12 실제로 겪음).
+     * 그래서 세 가지를 구분한다 — 설정 없음 / 붙지 못함 / 정상.
+     *
+     * <p><b>접속 문자열·비밀번호는 절대 담지 않는다.</b> 접속 주소가 설정됐는지(true/false)와
+     * 실패한 예외의 종류 이름만 알려 준다.
+     */
+    public Map<String, Object> readiness() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        String url = environment.getProperty("estate.datasource.url", "");
+        boolean configured = url != null && !url.isBlank();
+        result.put("configured", configured);
+
+        EstateMapper mapper = mapperProvider.getIfAvailable();
+        if (!configured || mapper == null) {
+            result.put("reason", "NOT_CONFIGURED");
+            result.put(
+                    "detail",
+                    "DB 접속 정보가 없습니다(ESTATE_DB_URL). 운영은 k8s Secret estate-db-credentials,"
+                            + " 로컬은 settings.local.json 으로 넣습니다.");
+            return result;
+        }
+
+        // 접속 정보는 있다 — 실제로 붙는지 가벼운 조회로 확인한다(통계 한 줄).
+        try {
+            mapper.selectRowEstimates();
+            result.put("reason", "READY");
+            return result;
+        } catch (Exception e) {
+            log.warn("부동산 DB 접속 확인 실패", e);
+            result.put("reason", "CONNECT_FAILED");
+            result.put(
+                    "detail",
+                    "접속 정보는 있지만 DB 에 연결하지 못했습니다(" + e.getClass().getSimpleName()
+                            + "). 접속 주소·계정 권한·estate 스키마 표를 확인하세요.");
+            return result;
+        }
     }
 
     public List<Map<String, Object>> propertyTypes() {
