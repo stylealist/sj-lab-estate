@@ -43,6 +43,14 @@
                           where oid = 'estate.apt_rent'::regclass))  as rent_rows
     </select>
 
+    <!--
+      조회 권한까지 확인하는 probe. pg_class(통계)만 읽으면 권한 없는 계정도 통과하므로
+      실제 표에서 한 행을 읽는다. limit 1 이라 첫 행에서 멈춘다.
+    -->
+    <select id="selectReadinessProbe" resultType="java.lang.Integer">
+        select 1 from estate.apt_trade limit 1
+    </select>
+
     <!-- ${table} 은 서비스가 정한 상수만 들어온다(화이트리스트). 사용자 입력을 넣지 말 것. -->
     <select id="selectPeriodBound" resultType="map">
         select deal_year, deal_month

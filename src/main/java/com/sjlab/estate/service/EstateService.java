@@ -86,9 +86,10 @@ public class EstateService {
             return result;
         }
 
-        // 접속 정보는 있다 — 실제로 붙는지 가벼운 조회로 확인한다(통계 한 줄).
+        // 접속 정보는 있다 — 실제 표를 한 행 읽어 **접속과 조회 권한까지** 확인한다.
+        // 통계(pg_class)만 읽으면 권한 없는 계정도 통과해 "정상"으로 보고된다(실제로 겪음).
         try {
-            mapper.selectRowEstimates();
+            mapper.selectReadinessProbe();
             result.put("reason", "READY");
             return result;
         } catch (Exception e) {
@@ -96,8 +97,8 @@ public class EstateService {
             result.put("reason", "CONNECT_FAILED");
             result.put(
                     "detail",
-                    "접속 정보는 있지만 DB 에 연결하지 못했습니다(" + e.getClass().getSimpleName()
-                            + "). 접속 주소·계정 권한·estate 스키마 표를 확인하세요.");
+                    "접속 정보는 있지만 조회하지 못했습니다(" + e.getClass().getSimpleName()
+                            + "). 접속 주소, 계정의 estate 스키마 읽기 권한, 표 존재를 확인하세요.");
             return result;
         }
     }

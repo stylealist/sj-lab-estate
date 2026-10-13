@@ -18,6 +18,15 @@ public interface EstateMapper {
     /** 표의 대략적인 건수(통계 기반 추정치). 정확히 세면 2,100만 행에서 30초가 걸린다. */
     Map<String, Object> selectRowEstimates();
 
+    /**
+     * 조회가 실제로 되는지 확인하는 probe.
+     *
+     * <p><b>통계(pg_class)만 읽어서는 안 된다</b> — 그 카탈로그는 권한이 없는 계정도 읽을 수 있어
+     * "정상"으로 보고된 뒤 실제 조회만 권한 오류로 실패한다(2026-10-13, estate 읽기 권한이 없는
+     * 계정으로 바꾸며 확인). 그래서 실제 표에서 한 행을 읽어 본다.
+     */
+    Integer selectReadinessProbe();
+
     /** 그 표의 가장 이른(또는 늦은) 거래 월. 식으로 비교하지 않아 기간 인덱스를 그대로 쓴다. */
     Map<String, Object> selectPeriodBound(@Param("table") String table, @Param("desc") boolean desc);
 
