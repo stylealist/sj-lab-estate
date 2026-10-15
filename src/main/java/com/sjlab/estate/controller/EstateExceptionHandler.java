@@ -33,6 +33,11 @@ public class EstateExceptionHandler {
         return body(HttpStatus.BAD_REQUEST, e.code, e.getMessage());
     }
 
+    @ExceptionHandler(EstateController.NotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(EstateController.NotFoundException e) {
+        return body(HttpStatus.NOT_FOUND, e.code, e.getMessage());
+    }
+
     @ExceptionHandler(EstateController.NotReadyException.class)
     public ResponseEntity<Map<String, Object>> handleNotReady(EstateController.NotReadyException e) {
         return body(HttpStatus.SERVICE_UNAVAILABLE, e.code, e.getMessage());

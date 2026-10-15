@@ -134,6 +134,193 @@ public class EstateController {
         return items(estateService.getTrades(sggCd, umdNm, fromYm, toYm, aptNm, size));
     }
 
+    /**
+     * 지도용 지역 경계 + 평균가(GeoJSON).
+     *
+     * <p>좌표가 없어도 되는 지도다 — 행정구역 경계가 이미 DB 에 있어 **지역별 평균가를 색으로**
+     * 칠한다. 단지 핀은 좌표가 모이면 같은 지도 위에 얹는다.
+     *
+     * <p>`level=sgg` 는 시군구(시도를 주면 그 안만), `level=emd` 는 한 시군구 안의 읍면동이다.
+     * **전국 시군구는 경계가 크고 집계도 무겁다** — 화면은 기본으로 시도를 지정해 부른다.
+     *
+     * <p>응답은 GeoJSON 이라 지도 라이브러리가 그대로 읽는다(오류도 JSON 형식을 지킨다).
+     */
+    @GetMapping(value = "/{propertyType}/map/regions", produces = "application/json")
+    public ResponseEntity<String> mapRegions(
+            @PathVariable String propertyType,
+            @RequestParam(defaultValue = "sgg") String level,
+            @RequestParam(required = false) String sidoCd,
+            @RequestParam(required = false) String sggCd,
+            @RequestParam(required = false) Integer fromYm,
+            @RequestParam(required = false) Integer toYm,
+            @RequestParam(required = false, defaultValue = "1") String stats) {
+        checkPropertyType(propertyType);
+        checkYm(fromYm, "fromYm");
+        checkYm(toYm, "toYm");
+
+        String geojson;
+        if ("emd".equalsIgnoreCase(level)) {
+            checkSggCd(sggCd);
+            if (sggCd == null || sggCd.isBlank()) {
+                throw new BadRequestException("MISSING_PARAMETER", "level=emd 는 sggCd 가 필요합니다.");
+            }
+            geojson = estateService.getMapRegionsEmd(sggCd, fromYm, toYm);
+        } else if ("sgg".equalsIgnoreCase(level)) {
+            checkSidoCd(sidoCd);
+            geojson = estateService.getMapRegionsSgg(sidoCd, fromYm, toYm);
+        } else if ("sido".equalsIgnoreCase(level)) {
+            // stats=0 은 "경계만" — 지도가 어느 시도를 보고 있는지 판단할 때 쓴다(집계는 무겁다)
+            geojson = estateService.getMapRegionsSido(fromYm, toYm, !"0".equals(stats));
+        } else {
+            throw new BadRequestException("INVALID_PARAMETER", "level 은 sido, sgg, emd 중 하나입니다.");
+        }
+
+        // 경계는 자주 바뀌지 않는다 — 브라우저가 잠시 들고 있게 한다(지도를 움직일 때마다 받지 않도록)
+        return ResponseEntity.ok()
+                .header("Cache-Control", "public, max-age=300")
+                .body(geojson);
+    }
+
+    /**
+     * 화면 영역 안의 단지 핀(GeoJSON Point). 호갱노노의 아파트 핀에 해당한다.
+     *
+     * <p>좌표는 실거래 원천에 없어 따로 모은다(`estate.apt_complex`). 아직 비어 있으면
+     * <b>빈 목록 + `coordinates_ready:false`</b> 로 답한다 — 화면이 "핀 없음"과 "준비 전"을
+     * 구분해 안내할 수 있어야 한다. 오류로 답하면 지도 전체가 깨진 것처럼 보인다.
+     */
+    @GetMapping(value = "/{propertyType}/map/complexes", produces = "application/json")
+    public ResponseEntity<String> mapComplexes(
+            @PathVariable String propertyType,
+            @RequestParam String bbox,
+            @RequestParam(required = false) Integer fromYm,
+            @RequestParam(required = false) Integer toYm,
+            @RequestParam(required = false) Integer limit) {
+        checkPropertyType(propertyType);
+        checkYm(fromYm, "fromYm");
+        checkYm(toYm, "toYm");
+
+        double[] box = parseBbox(bbox);
+        String geojson = estateService.getMapComplexPins(
+                box[0], box[1], box[2], box[3], fromYm, toYm, limit == null ? 300 : limit);
+
+        // 지도를 움직이는 동안 같은 영역을 다시 부르는 일이 잦다 — 짧게 들고 있게 한다.
+        return ResponseEntity.ok()
+                .header("Cache-Control", "public, max-age=60")
+                .body(geojson);
+    }
+
+    /**
+     * `bbox=minX,minY,maxX,maxY`(EPSG:3857, 지도 뷰와 같은 좌표계)를 숫자 4개로 바꾼다.
+     * 지도 레이어(mapservice-rest)와 같은 형식·같은 좌표계로 맞춘 것이다.
+     */
+    private double[] parseBbox(String bbox) {
+        if (bbox == null || bbox.isBlank()) {
+            throw new BadRequestException("MISSING_PARAMETER", "bbox 는 필수입니다(minX,minY,maxX,maxY).");
+        }
+        String[] parts = bbox.split(",");
+        if (parts.length != 4) {
+            throw new BadRequestException("INVALID_PARAMETER", "bbox 는 쉼표로 나눈 숫자 4개여야 합니다.");
+        }
+        double[] values = new double[4];
+        for (int i = 0; i < 4; i++) {
+            try {
+                values[i] = Double.parseDouble(parts[i].trim());
+            } catch (NumberFormatException e) {
+                throw new BadRequestException("INVALID_PARAMETER", "bbox 에 숫자가 아닌 값이 있습니다.");
+            }
+        }
+        if (values[0] >= values[2] || values[1] >= values[3]) {
+            throw new BadRequestException("INVALID_PARAMETER", "bbox 의 최소값이 최대값보다 커서는 안 됩니다.");
+        }
+        return values;
+    }
+
+    // ── 단지(아파트) 단위 — 호갱노노식 단지 패널에 쓰는 것들 ─────────────────
+    // 단지 키 apt_seq 는 "11680-218" 처럼 앞 5자리가 시군구 코드다(서비스가 잘라 쓴다).
+    // 읍면동(umdNm)을 함께 주면 조회가 더 좁아진다 — 화면은 이미 알고 있으므로 넘겨 준다.
+
+    /** 지역 안의 단지 목록(거래 많은 순). `q` 로 단지명 일부 검색. */
+    @GetMapping("/{propertyType}/complexes")
+    public Map<String, Object> complexes(
+            @PathVariable String propertyType,
+            @RequestParam String sggCd,
+            @RequestParam(required = false) String umdNm,
+            @RequestParam(required = false, name = "q") String keyword,
+            @RequestParam(required = false) Integer limit) {
+        checkPropertyType(propertyType);
+        checkSggCd(sggCd);
+        if (sggCd == null || sggCd.isBlank()) {
+            throw new BadRequestException("MISSING_PARAMETER", "sggCd 는 필수입니다(숫자 5자리).");
+        }
+        checkUmdNm(sggCd, umdNm);
+        if (keyword != null && keyword.length() > 40) {
+            throw new BadRequestException("INVALID_PARAMETER", "q 는 40자 이하여야 합니다.");
+        }
+        int size = clamp(limit, 100, 1, 500, "limit");
+        return items(estateService.getComplexes(sggCd, umdNm, keyword, size));
+    }
+
+    /** 단지 기본 정보 + 평형별 요약(평형은 **전용면적** 기준). */
+    @GetMapping("/{propertyType}/complexes/{aptSeq}")
+    public Map<String, Object> complexDetail(
+            @PathVariable String propertyType,
+            @PathVariable String aptSeq,
+            @RequestParam(required = false) String umdNm) {
+        checkPropertyType(propertyType);
+        checkAptSeq(aptSeq);
+        Map<String, Object> detail = estateService.getComplexDetail(aptSeq, umdNm);
+        if (detail.isEmpty()) {
+            throw new NotFoundException("COMPLEX_NOT_FOUND", "그 단지의 거래 기록을 찾지 못했습니다: " + aptSeq);
+        }
+        return detail;
+    }
+
+    /** 단지(평형) 월별 매매 추세. */
+    @GetMapping("/{propertyType}/complexes/{aptSeq}/monthly")
+    public Map<String, Object> complexMonthly(
+            @PathVariable String propertyType,
+            @PathVariable String aptSeq,
+            @RequestParam(required = false) String umdNm,
+            @RequestParam(required = false) Integer pyeong,
+            @RequestParam(required = false) Integer fromYm,
+            @RequestParam(required = false) Integer toYm) {
+        checkPropertyType(propertyType);
+        checkAptSeq(aptSeq);
+        checkYm(fromYm, "fromYm");
+        checkYm(toYm, "toYm");
+        return items(estateService.getComplexMonthly(aptSeq, umdNm, pyeong, fromYm, toYm));
+    }
+
+    /** 단지(평형) 월별 전월세. */
+    @GetMapping("/{propertyType}/complexes/{aptSeq}/rent/monthly")
+    public Map<String, Object> complexRentMonthly(
+            @PathVariable String propertyType,
+            @PathVariable String aptSeq,
+            @RequestParam(required = false) String umdNm,
+            @RequestParam(required = false) Integer pyeong,
+            @RequestParam(required = false) Integer fromYm,
+            @RequestParam(required = false) Integer toYm) {
+        checkPropertyType(propertyType);
+        checkAptSeq(aptSeq);
+        checkYm(fromYm, "fromYm");
+        checkYm(toYm, "toYm");
+        return items(estateService.getComplexRentMonthly(aptSeq, umdNm, pyeong, fromYm, toYm));
+    }
+
+    /** 단지(평형) 최근 거래 목록. */
+    @GetMapping("/{propertyType}/complexes/{aptSeq}/trades")
+    public Map<String, Object> complexTrades(
+            @PathVariable String propertyType,
+            @PathVariable String aptSeq,
+            @RequestParam(required = false) String umdNm,
+            @RequestParam(required = false) Integer pyeong,
+            @RequestParam(required = false) Integer limit) {
+        checkPropertyType(propertyType);
+        checkAptSeq(aptSeq);
+        int size = clamp(limit, 50, 1, 500, "limit");
+        return items(estateService.getComplexTrades(aptSeq, umdNm, pyeong, size));
+    }
+
     @GetMapping("/{propertyType}/trade/ranking")
     public Map<String, Object> tradeRanking(
             @PathVariable String propertyType,
@@ -173,6 +360,13 @@ public class EstateController {
     private void checkSggCd(String sggCd) {
         if (sggCd != null && !sggCd.isBlank() && !sggCd.matches("\\d{5}")) {
             throw new BadRequestException("INVALID_PARAMETER", "sggCd 는 숫자 5자리입니다(예: 11680).");
+        }
+    }
+
+    /** 단지 키는 "11680-218" 형태다(앞 5자리가 시군구 코드). */
+    private void checkAptSeq(String aptSeq) {
+        if (aptSeq == null || !aptSeq.matches("\\d{5}-\\S{1,20}")) {
+            throw new BadRequestException("INVALID_PARAMETER", "aptSeq 형식이 올바르지 않습니다(예: 11680-218).");
         }
     }
 
@@ -228,6 +422,16 @@ public class EstateController {
         final String code;
 
         BadRequestException(String code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    /** 404 — 그런 단지가 없다(거래 기록이 없다). */
+    static class NotFoundException extends RuntimeException {
+        final String code;
+
+        NotFoundException(String code, String message) {
             super(message);
             this.code = code;
         }

@@ -287,12 +287,92 @@ public class EstateService {
                 long started = System.currentTimeMillis();
                 int count = getRegions().size();
                 log.info("지역 목록 예열 완료: {}개 ({}ms)", count, System.currentTimeMillis() - started);
+
+                // 지도 경계도 미리 깎아 둔다 — 첫 방문자가 8초를 기다리지 않도록.
+                // 화면 기본값이 서울이라 서울부터 받아 둔다.
+                long mapStarted = System.currentTimeMillis();
+                getMapRegionsSgg("11", null, null);
+                log.info("지도 경계 예열 완료: 서울 시군구 ({}ms)", System.currentTimeMillis() - mapStarted);
+
+                warmUpRemainingSido();
+                warmUpSidoStats();
             } catch (Exception e) {
                 log.info("지역 목록 예열 건너뜀: {}", e.getClass().getSimpleName());
             }
         }, "estate-regions-warmup");
         worker.setDaemon(true);
         worker.start();
+    }
+
+    /**
+     * 서울 말고 나머지 시도의 경계도 뒤에서 미리 깎아 둔다.
+     *
+     * <p>경계 단순화는 한 번만 하면 캐시에 남지만 <b>처음 한 번이 느리다</b>(경기도 12.7초 —
+     * 2026-10-14 실측. 시군구가 많고 섬·해안선이 복잡한 시도가 특히 오래 걸린다). 다른 시도를
+     * 처음 누른 사람이 그 시간을 혼자 부담하지 않도록 기동 후에 한 번씩 돌려 둔다.
+     *
+     * <p>한 번에 하나씩, 사이를 조금 띄워 돈다 — 기동 직후에 DB를 몰아치면 정작 화면 조회가
+     * 밀린다. 실패한 시도는 건너뛰고 다음으로 간다(그 시도는 누를 때 받으면 된다).
+     */
+    private void warmUpRemainingSido() {
+        List<String> sidoCodes = new ArrayList<>();
+        for (Map<String, Object> region : getRegions()) {
+            Object code = region.get("sido_cd");
+            String sidoCd = code == null ? "" : String.valueOf(code);
+            if (!sidoCd.isBlank() && !"11".equals(sidoCd) && !sidoCodes.contains(sidoCd)) {
+                sidoCodes.add(sidoCd);
+            }
+        }
+
+        long started = System.currentTimeMillis();
+        int done = 0;
+        for (String sidoCd : sidoCodes) {
+            try {
+                getMapRegionsSgg(sidoCd, null, null);
+                done++;
+                Thread.sleep(500L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RuntimeException e) {
+                log.info("지도 경계 예열 건너뜀(시도 {}): {}", sidoCd, e.getClass().getSimpleName());
+            }
+        }
+        log.info("지도 경계 예열 완료: 시도 {}/{}개 ({}ms)", done, sidoCodes.size(),
+                System.currentTimeMillis() - started);
+    }
+
+    /**
+     * 전국 시도 집계를 화면 기본 기간으로 미리 계산해 둔다.
+     *
+     * <p>화면 기본값은 "가장 최근 달부터 12개월"이다(프론트 `buildMonthOptions`). 그 조합을 미리
+     * 계산해 두면 사용자가 지도를 끝까지 줌아웃해도 색이 바로 보인다. 다른 기간을 고르면
+     * 그때는 경계만 먼저 나가고 집계가 뒤따라온다.
+     */
+    private void warmUpSidoStats() {
+        try {
+            Integer latest = periodBound(mapper(), TRADE_TABLE, true);
+            if (latest == null) {
+                return;
+            }
+            int toYm = latest;
+            int year = toYm / 100;
+            int month = toYm % 100;
+            // 11개월 뒤로 — 최근 달을 포함해 12개월이 된다
+            month -= 11;
+            while (month <= 0) {
+                month += 12;
+                year -= 1;
+            }
+            int fromYm = year * 100 + month;
+            long started = System.currentTimeMillis();
+            sidoStatsCache.put("sido:" + fromYm + "-" + toYm,
+                    mapper().selectRegionStatsSido(fromYm, toYm));
+            log.info("전국 시도 집계 예열 완료: {}~{} ({}ms)", fromYm, toYm,
+                    System.currentTimeMillis() - started);
+        } catch (RuntimeException e) {
+            log.info("전국 시도 집계 예열 건너뜀: {}", e.getClass().getSimpleName());
+        }
     }
 
     /** 그 시군구의 읍면동 목록. 자연키 인덱스를 타서 빠르므로 캐시하지 않는다(실측 51ms). */
@@ -337,6 +417,319 @@ public class EstateService {
     public List<Map<String, Object>> getTrades(
             String sggCd, String umdNm, Integer fromYm, Integer toYm, String aptNm, int limit) {
         return new ArrayList<>(mapper().selectTrades(sggCd, umdNm, fromYm, toYm, aptNm, limit));
+    }
+
+    // ── 지도 ────────────────────────────────────────────────────────────
+    /**
+     * 경계를 단순화하는 정도. 화면에서 보이는 차이는 없고 응답 크기만 줄어든다.
+     *
+     * <p>전국 시군구 원본이 37MB 라 그대로 내보낼 수 없다(단순화 0.005 → 791KB, 실측).
+     * 좁은 범위일수록 섬세하게 둔다.
+     */
+    private static final double TOLERANCE_SIDO = 0.02;       // 전국을 한 화면에
+    private static final double TOLERANCE_SGG_ALL = 0.005;   // 전국
+    private static final double TOLERANCE_SGG_SIDO = 0.002;  // 한 시도 안
+    private static final double TOLERANCE_EMD = 0.0005;      // 한 시군구 안의 읍면동
+
+    private static final String EMPTY_FEATURES = "{\"type\":\"FeatureCollection\",\"features\":[]}";
+
+    /**
+     * 경계 캐시.
+     *
+     * <p>경계는 <b>기간과 무관하고 바뀌지도 않는다</b>. 반면 깎는(단순화) 비용이 커서 매번 읽으면
+     * 서울 8.7초·전국 8.4초였다(실측). 한 번 읽어 두고 다시 쓴다 — 기간을 바꿔도 다시 읽지 않는다.
+     * 키는 "sgg:11" / "emd:11680" 처럼 단계+코드다.
+     */
+    private final java.util.Map<String, List<Map<String, Object>>> boundaryCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 시도별 집계 캐시(기간이 키).
+     *
+     * <p>시도 평균가는 <b>전국 전건을 읽어야</b> 나온다(실측 4~5초). 지도를 끝까지 줌아웃할 때마다
+     * 그 시간을 사람이 기다리면 쓸 수 없는 화면이 된다. 기간 조합은 화면 기본값(최근 12개월)에
+     * 거의 고정되므로 기간을 키로 담아 두면 대부분 바로 맞는다. 수집이 돌 때만 값이 바뀌므로
+     * 오래 들고 있어도 된다.
+     */
+    private final java.util.Map<String, List<Map<String, Object>>> sidoStatsCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 시도 집계를 뒤에서 계산하는 중인 기간(같은 기간을 여러 번 계산하지 않게). */
+    private final java.util.Set<String> sidoStatsLoading =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * 전국 시도 경계 + 평균가(GeoJSON). 지도를 끝까지 줌아웃했을 때 쓴다.
+     *
+     * <p><b>집계가 없으면 기다리지 않는다.</b> 전국 평균은 990만 건을 모두 읽어야 나와서 28초가
+     * 걸렸다(2026-10-15 실측). 그 시간을 사람이 지도 앞에서 기다리면 멈춘 화면으로 보이므로,
+     * <b>경계를 먼저 돌려주고(회색) 집계는 뒤에서 계산</b>한다. 응답의 {@code stats_pending} 이
+     * true 면 화면이 잠시 뒤 다시 물어 색을 채운다.
+     *
+     * @param withStats false 면 집계를 아예 건드리지 않는다 — 지도가 "지금 어느 시도인가"를
+     *                  판단하려고 경계만 필요할 때 쓴다(그 호출이 전국 집계를 깨우면 안 된다).
+     */
+    public String getMapRegionsSido(Integer fromYm, Integer toYm, boolean withStats) {
+        List<Map<String, Object>> boundaries = boundaryCache.computeIfAbsent(
+                "sido:ALL", key -> mapper().selectBoundarySido(TOLERANCE_SIDO));
+        if (!withStats) {
+            return toFeatureCollection(boundaries, null, "sido", false);
+        }
+        String key = "sido:" + fromYm + "-" + toYm;
+        List<Map<String, Object>> stats = sidoStatsCache.get(key);
+        if (stats != null) {
+            return toFeatureCollection(boundaries, stats, "sido", false);
+        }
+        loadSidoStatsInBackground(key, fromYm, toYm);
+        return toFeatureCollection(boundaries, null, "sido", true);
+    }
+
+    private void loadSidoStatsInBackground(String key, Integer fromYm, Integer toYm) {
+        if (!sidoStatsLoading.add(key)) {
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            try {
+                long started = System.currentTimeMillis();
+                List<Map<String, Object>> stats = mapper().selectRegionStatsSido(fromYm, toYm);
+                sidoStatsCache.put(key, stats);
+                log.info("전국 시도 집계 완료: {} ({}ms)", key, System.currentTimeMillis() - started);
+            } catch (RuntimeException e) {
+                log.info("전국 시도 집계 실패: {}", e.getClass().getSimpleName());
+            } finally {
+                sidoStatsLoading.remove(key);
+            }
+        }, "estate-sido-stats");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** 시군구 경계 + 평균가(GeoJSON). 시도를 주면 그 안만 — 전국은 경계가 크다. */
+    public String getMapRegionsSgg(String sidoCd, Integer fromYm, Integer toYm) {
+        boolean hasSido = sidoCd != null && !sidoCd.isBlank();
+        double tolerance = hasSido ? TOLERANCE_SGG_SIDO : TOLERANCE_SGG_ALL;
+        List<Map<String, Object>> boundaries = boundaryCache.computeIfAbsent(
+                "sgg:" + (hasSido ? sidoCd : "ALL"),
+                key -> mapper().selectBoundarySgg(hasSido ? sidoCd : null, tolerance));
+        List<Map<String, Object>> stats = mapper().selectRegionStatsSgg(hasSido ? sidoCd : null, fromYm, toYm);
+        return toFeatureCollection(boundaries, stats, "sgg");
+    }
+
+    /** 한 시군구 안의 읍면동 경계 + 평균가(GeoJSON). */
+    public String getMapRegionsEmd(String sggCd, Integer fromYm, Integer toYm) {
+        List<Map<String, Object>> boundaries = boundaryCache.computeIfAbsent(
+                "emd:" + sggCd, key -> mapper().selectBoundaryEmd(sggCd, TOLERANCE_EMD));
+        List<Map<String, Object>> stats = mapper().selectRegionStatsEmd(sggCd, fromYm, toYm);
+        return toFeatureCollection(boundaries, stats, "emd");
+    }
+
+    // ── 지도 단지 핀 ─────────────────────────────────────────────────────
+
+    /** 단지 핀 1회 조회 상한. 호갱노노처럼 라벨을 달기 때문에 너무 많으면 글자가 겹친다. */
+    private static final int PIN_LIMIT_MAX = 500;
+
+    /**
+     * 단지 마스터 표가 있는지. <b>없을 수 있다</b> — DDL 은 DB 담당자가 실행하는 규칙이라
+     * 코드가 먼저 배포되는 상황이 정상이다. 없는데 조회하면 500 이 나므로 먼저 확인하고,
+     * 결과를 들고 있다가 <b>60초마다 다시 본다</b>(표가 생기면 재기동 없이 반영되도록).
+     */
+    private volatile boolean complexTableExists = false;
+    private volatile long complexTableCheckedAt = 0L;
+
+    private boolean complexTableReady() {
+        long now = System.currentTimeMillis();
+        if (complexTableExists || now - complexTableCheckedAt > 60_000L) {
+            try {
+                complexTableExists = mapper().existsComplexTable() != null;
+            } catch (RuntimeException e) {
+                complexTableExists = false;
+            }
+            complexTableCheckedAt = now;
+        }
+        return complexTableExists;
+    }
+
+    /**
+     * 화면 영역 안의 단지 핀(GeoJSON).
+     *
+     * <p>좌표가 아직 없으면 <b>빈 목록과 함께 그 사실을 응답에 담는다</b> — 화면이 "핀이 없는
+     * 지도"와 "아직 좌표를 못 받은 지도"를 구분해 알려 줄 수 있어야 한다. 수집 진행률(전체/받은 수)도
+     * 같이 내려 화면에 "44,581개 중 0개" 처럼 보여 준다.
+     */
+    public String getMapComplexPins(
+            double minX, double minY, double maxX, double maxY, Integer fromYm, Integer toYm, int limit) {
+        int capped = Math.max(1, Math.min(limit, PIN_LIMIT_MAX));
+        if (!complexTableReady()) {
+            return "{\"type\":\"FeatureCollection\",\"features\":[],\"coordinates_ready\":false,"
+                    + "\"reason\":\"NO_TABLE\",\"message\":\"단지 좌표 표가 아직 만들어지지 않았습니다.\"}";
+        }
+
+        long total = 0;
+        long geocoded = 0;
+        try {
+            Map<String, Object> progress = mapper().selectComplexGeocodeStats();
+            if (progress != null) {
+                total = asLong(progress.get("total"));
+                geocoded = asLong(progress.get("geocoded"));
+            }
+        } catch (RuntimeException e) {
+            log.info("좌표 진행률을 읽지 못했다: {}", e.getClass().getSimpleName());
+        }
+
+        List<Map<String, Object>> pins = geocoded == 0
+                ? List.of()
+                : mapper().selectComplexPins(minX, minY, maxX, maxY, fromYm, toYm, capped);
+
+        StringBuilder sb = new StringBuilder(pins.size() * 256 + 256);
+        sb.append("{\"type\":\"FeatureCollection\",\"coordinates_ready\":").append(geocoded > 0)
+                .append(",\"complex_total\":").append(total)
+                .append(",\"complex_geocoded\":").append(geocoded)
+                .append(",\"features\":[");
+        boolean first = true;
+        for (Map<String, Object> pin : pins) {
+            Object lon = pin.get("lon");
+            Object lat = pin.get("lat");
+            if (lon == null || lat == null) {
+                continue;
+            }
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            sb.append("{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[")
+                    .append(lon).append(',').append(lat).append("]},\"properties\":{")
+                    .append("\"apt_seq\":\"").append(escape(String.valueOf(pin.get("apt_seq"))))
+                    .append("\",\"apt_nm\":\"").append(escape(String.valueOf(pin.get("apt_nm"))))
+                    .append("\",\"umd_nm\":\"").append(escape(String.valueOf(pin.get("umd_nm"))))
+                    .append("\",\"sgg_cd\":\"").append(escape(String.valueOf(pin.get("sgg_cd"))))
+                    .append("\",\"build_year\":").append(numberOrNull(pin, "build_year"))
+                    .append(",\"deal_count\":").append(numberOrNull(pin, "deal_count"))
+                    .append(",\"avg_amount\":").append(numberOrNull(pin, "avg_amount"))
+                    .append(",\"avg_amount_per_m2\":").append(numberOrNull(pin, "avg_amount_per_m2"))
+                    .append(",\"area_min\":").append(numberOrNull(pin, "area_min"))
+                    .append(",\"area_max\":").append(numberOrNull(pin, "area_max"))
+                    .append("}}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private long asLong(Object value) {
+        return value instanceof Number ? ((Number) value).longValue() : 0L;
+    }
+
+    /**
+     * 경계 + 집계를 GeoJSON 문자열로 합친다.
+     *
+     * <p>JSON 라이브러리를 쓰지 않고 이어 붙인다 — geometry 는 DB 가 만든 JSON 문자열이라 그대로
+     * 넣으면 되고, 나머지는 숫자와 짧은 이름뿐이다(이름은 따옴표만 escape 한다).
+     */
+    private String toFeatureCollection(
+            List<Map<String, Object>> boundaries, List<Map<String, Object>> stats, String level) {
+        return toFeatureCollection(boundaries, stats, level, false);
+    }
+
+    private String toFeatureCollection(
+            List<Map<String, Object>> boundaries, List<Map<String, Object>> stats, String level,
+            boolean statsPending) {
+        if (boundaries == null || boundaries.isEmpty()) {
+            return EMPTY_FEATURES;
+        }
+        Map<String, Map<String, Object>> statByCode = new LinkedHashMap<>();
+        if (stats != null) {
+            for (Map<String, Object> row : stats) {
+                statByCode.put(String.valueOf(row.get("code")), row);
+            }
+        }
+
+        StringBuilder sb = new StringBuilder(boundaries.size() * 512);
+        sb.append("{\"type\":\"FeatureCollection\"");
+        if (statsPending) {
+            // 화면이 "색이 아직 없는 이유"를 알고 잠시 뒤 다시 묻게 한다
+            sb.append(",\"stats_pending\":true");
+        }
+        sb.append(",\"features\":[");
+        boolean first = true;
+        for (Map<String, Object> boundary : boundaries) {
+            Object geometry = boundary.get("geometry");
+            if (geometry == null) {
+                continue;
+            }
+            String code = String.valueOf(boundary.get("code"));
+            Map<String, Object> stat = statByCode.get(code);
+
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            sb.append("{\"type\":\"Feature\",\"geometry\":").append(geometry)
+                    .append(",\"properties\":{\"level\":\"").append(level)
+                    .append("\",\"code\":\"").append(code)
+                    .append("\",\"name\":\"").append(escape(String.valueOf(boundary.get("name"))))
+                    .append("\",\"deal_count\":").append(stat == null ? "0" : String.valueOf(stat.get("deal_count")))
+                    .append(",\"avg_amount\":").append(numberOrNull(stat, "avg_amount"))
+                    .append(",\"avg_amount_per_m2\":").append(numberOrNull(stat, "avg_amount_per_m2"))
+                    .append("}}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private String numberOrNull(Map<String, Object> stat, String key) {
+        if (stat == null || stat.get(key) == null) {
+            return "null";
+        }
+        return String.valueOf(stat.get(key));
+    }
+
+    private String escape(String text) {
+        return text == null ? "" : text.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    // ── 단지(아파트) 단위 ────────────────────────────────────────────────
+    // 단지 키 apt_seq 의 앞 5자리가 시군구 코드다. 인덱스가 없는 컬럼이라 **시군구 조건을 함께**
+    // 걸어야 그 시군구만 읽는다(실측 134ms). 그 조립을 여기서 한 곳으로 모은다.
+
+    /** apt_seq(예: 11680-218) 앞 5자리 = 시군구 코드. */
+    private String sggCdOf(String aptSeq) {
+        if (aptSeq == null || aptSeq.length() < 5) {
+            throw new IllegalArgumentException("aptSeq");
+        }
+        return aptSeq.substring(0, 5);
+    }
+
+    public List<Map<String, Object>> getComplexes(String sggCd, String umdNm, String keyword, int limit) {
+        return new ArrayList<>(mapper().selectComplexes(sggCd, umdNm, keyword, limit));
+    }
+
+    /** 단지 기본 정보 + 평형별 요약을 한 번에 돌려준다(화면이 둘을 함께 쓰기 때문). */
+    public Map<String, Object> getComplexDetail(String aptSeq, String umdNm) {
+        EstateMapper mapper = mapper();
+        String sggCd = sggCdOf(aptSeq);
+        Map<String, Object> summary = mapper.selectComplexSummary(sggCd, aptSeq, umdNm);
+        if (summary == null || summary.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Object> result = new LinkedHashMap<>(summary);
+        result.put("areas", mapper.selectComplexAreas(sggCd, aptSeq, umdNm));
+        return result;
+    }
+
+    public List<Map<String, Object>> getComplexMonthly(
+            String aptSeq, String umdNm, Integer pyeong, Integer fromYm, Integer toYm) {
+        return new ArrayList<>(
+                mapper().selectComplexMonthly(sggCdOf(aptSeq), aptSeq, umdNm, pyeong, fromYm, toYm));
+    }
+
+    public List<Map<String, Object>> getComplexRentMonthly(
+            String aptSeq, String umdNm, Integer pyeong, Integer fromYm, Integer toYm) {
+        return new ArrayList<>(
+                mapper().selectComplexRentMonthly(sggCdOf(aptSeq), aptSeq, umdNm, pyeong, fromYm, toYm));
+    }
+
+    public List<Map<String, Object>> getComplexTrades(
+            String aptSeq, String umdNm, Integer pyeong, int limit) {
+        return new ArrayList<>(mapper().selectComplexTrades(sggCdOf(aptSeq), aptSeq, umdNm, pyeong, limit));
     }
 
     /** 지역별 평균 매매가 순위. 시도를 주면 그 시도 안에서만 순위를 낸다. */

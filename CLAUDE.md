@@ -50,6 +50,12 @@ mvnw.cmd test                                                 # 컨텍스트 로
 - **기간 조건을 `deal_year * 100 + deal_month` 같은 식으로 비교하지 말 것.** 식에는 인덱스가 걸리지
   않아 전건을 훑습니다(실측 지역 순위 23.5초 → 고친 뒤 1.5초). 연도를 범위로 좁힌 뒤 경계 연도에서만
   월을 봅니다(`EstateMapper.xml` 의 `ymFilter`).
+- **단지(아파트) 단위 조회는 `sgg_cd` 조건을 반드시 함께 건다**(2026-10-14).
+  단지 키 `apt_seq`(예: `11680-218`)에는 **인덱스가 없다** — 단독으로 조회하면 990만 건을 전부
+  훑는다. 앞 5자리가 시군구 코드이므로 서비스가 잘라 넣어 `(sgg_cd, …)` 인덱스를 타게 한다
+  (실측 134ms, 읍면동까지 주면 더 좁아진다). `EstateService.sggCdOf()` 가 그 조립을 맡는다.
+- **평형은 전용면적 기준이다.** 원천에 공급면적이 없어 분양 평형(호갱노노의 "24평")과 다를 수 있다 —
+  응답에 `area_min`·`area_max`(㎡)를 함께 담아 화면이 "전용 OO㎡"를 같이 보여 준다. 3.3058㎡ = 1평.
 - **지역은 시도 → 시군구 → 읍면동 3단계다**(2026-10-13).
   - 시도는 **시군구 코드 앞 2자리**다. 시군구 목록 응답에 `sido_cd`·`sido_nm` 을 함께 담아
     화면이 시도 목록을 그 응답만으로 만든다(호출을 늘리지 않는다).
@@ -87,14 +93,39 @@ mvnw.cmd test                                                 # 컨텍스트 로
 | `GET /estate/{propertyType}/rent/monthly?sggCd=&fromYm=&toYm=` | 전월세 월별 추세 |
 | `GET /estate/{propertyType}/trade?sggCd=&fromYm=&toYm=&aptNm=&limit=` | 매매 거래 목록(최근 순, 최대 1000) |
 | `GET /estate/{propertyType}/trade/ranking?fromYm=&toYm=&limit=` | 지역별 평균 매매가 순위(10건 이상) |
+| `GET /estate/{propertyType}/map/regions?level=sido\|sgg\|emd&...&stats=` | 지도 경계 + 그 기간 평균가(GeoJSON) |
+| `GET /estate/{propertyType}/map/complexes?bbox=&fromYm=&toYm=&limit=` | 지도 아파트 핀(GeoJSON Point) |
 
 - 지역을 고르면 집계 뷰(`estate.v_apt_trade_monthly`·`v_apt_rent_monthly`)를 읽고, 전국이면 원본에서
   다시 합칩니다(뷰가 지역별이라 그대로 평균하면 틀립니다). **전국 조회는 느립니다**(매매 8.6초·전월세 28.7초) —
   미리 집계하는 스크립트가 `sj-lab/db/estate/estate_apt_monthly_matview.sql` 이고 실행은 DB 담당자가 합니다.
 
+## 지도 조회 (2026-10-15 추가)
+
+화면이 호갱노노 형태(본문 전체가 지도)로 바뀌면서 두 가지를 추가했습니다.
+
+- **경계와 집계를 따로 읽습니다.** 경계는 기간과 무관하고 깎는(단순화) 비용이 커서 한 번 읽어
+  `boundaryCache` 에 둡니다. 기간이 걸린 집계만 그때그때 읽어 Java 가 합칩니다(FeatureCollection
+  문자열을 직접 이어 붙입니다 — geometry 는 DB 가 만든 JSON 이라 그대로 넣으면 됩니다).
+- **전국(시도) 평균은 990만 건을 모두 읽어 28초입니다**(2026-10-15 실측). 그래서 세 가지를 둡니다.
+  **세 가지를 지우면 첫 화면이 수십 초 멈춥니다.**
+  1. 기동 시 **화면 기본 기간(최근 12개월)으로 미리 계산**합니다(`warmUpSidoStats`).
+  2. 캐시에 없으면 **경계만 먼저 보내고(`stats_pending:true`) 뒤에서 계산**합니다. 화면이 6초 뒤
+     한 번 더 물어 색을 채웁니다.
+  3. 지도가 "지금 어느 시도를 보고 있나"만 알려고 부를 때는 **`stats=0`**(경계만)으로 받습니다 —
+     보지도 않는 집계를 깨우지 않기 위한 것입니다.
+- **시도·시군구 경계는 기동 직후 백그라운드로 모두 예열합니다**(`warmUpRemainingSido`, 14개 60초).
+  경기도처럼 시군구가 많은 곳은 첫 호출이 12.7초였습니다.
+- **아파트 핀(`/map/complexes`)은 `estate.apt_complex` 가 없으면 오류가 아니라** 빈 목록 +
+  `coordinates_ready:false` + 사유로 답합니다(표가 없는 것은 정상 상태입니다 — DDL 은 담당자가
+  실행합니다). 표 유무는 60초마다 다시 확인해 재기동 없이 반영됩니다.
+- 핀 쿼리는 **bbox 로 단지를 먼저 고르고, 그 단지들의 시군구에서만 거래를 묶습니다.**
+  단지별로 하나씩 조회하면 300개 × 100ms 가 됩니다 — `apt_seq` 에는 인덱스가 없습니다.
+
 ## 현재 범위와 남은 작업
 
 - 운영 배포 전입니다 — Helm 차트(`sj-lab-k8s-manifests`)와 Jenkins 잡, 운영 DB 접속 Secret 이 필요합니다.
-- 지도용 좌표가 없습니다(원천 데이터에 좌표가 없음). 단지 좌표 표를 만들면 이 서비스에 지도용
-  조회를 추가하는 것이 자연스럽습니다.
+- **지도 조회는 들어갔지만 아파트 핀은 아직 비어 있습니다** — `estate.apt_complex` 표가 만들어지고
+  좌표가 채워지면(scheduler 의 지오코딩 배치 + 행안부 키) 코드 변경 없이 핀이 떠오릅니다.
+  절차는 `sj-lab/docs/estate-geocode-workflow.md`.
 - 오피스텔·빌라는 수집·표부터 필요합니다.

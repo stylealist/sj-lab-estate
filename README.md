@@ -25,6 +25,11 @@ sj-lab-estate-web → sj-lab-apigateway(/estate/**) → sj-lab-estate → Postgr
 | `GET /estate/{종류}/rent/monthly` | 전월세 월별 전세/월세 건수와 평균 보증금·월세 |
 | `GET /estate/{종류}/trade` | 매매 거래 목록(최근 계약일 순, 단지명 부분 검색) |
 | `GET /estate/{종류}/trade/ranking` | 기간 내 시군구 평균 매매가 순위 |
+| `GET /estate/{종류}/complexes?sggCd=&umdNm=&q=` | 지역 안의 단지 목록(거래 많은 순, 단지명 검색) |
+| `GET /estate/{종류}/complexes/{aptSeq}` | 단지 기본 정보 + **평형별 요약**(건수·평균·최근 거래) |
+| `GET /estate/{종류}/complexes/{aptSeq}/monthly` | 단지(평형) 월별 매매 추세 |
+| `GET /estate/{종류}/complexes/{aptSeq}/rent/monthly` | 단지(평형) 월별 전월세 |
+| `GET /estate/{종류}/complexes/{aptSeq}/trades` | 단지(평형) 최근 거래 목록 |
 
 공통 질의 파라미터는 `sggCd`(숫자 5자리) · `umdNm`(읍면동 **이름**) · `fromYm` · `toYm`(yyyyMM) · `limit` 입니다.
 순위는 `sidoCd`(숫자 2자리)로 그 시도 안에서만 낼 수 있습니다. `umdNm` 은 `sggCd` 와 함께 주세요
@@ -78,6 +83,9 @@ java -jar target\sj-lab-estate.jar --spring.profiles.active=local --server.port=
 | 전국 추세 | 8.6초(매매) · 28.7초(전월세) | — | 평균·중위 때문에 금액·면적을 실제로 읽어야 함(미리 집계하면 해결) |
 
 건수는 `count(*)` 가 아니라 통계 추정치를 쓰고 응답에 `rows_estimated: true` 로 밝힙니다.
+
+**평형은 전용면적 기준**입니다(원천에 공급면적이 없습니다). 응답에 전용 ㎡ 범위를 함께 담으므로
+화면에서 "전용 84㎡"를 같이 보여 주세요 — 숫자만 보여 주면 분양 평형으로 오해합니다.
 
 ## 현재 한계
 

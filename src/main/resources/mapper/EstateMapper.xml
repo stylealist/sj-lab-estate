@@ -210,6 +210,325 @@
         order by ym
     </select>
 
+    <!--
+      ═══════════════════════════ 지도용 지역 집계(GeoJSON) ═══════════════════════════
+      좌표가 없어도 되는 지도다 — **행정구역 경계는 이미 DB 에 있다**(public.g_sgg · g_emd).
+      지역별 평균가를 색으로 칠하고, 누르면 그 지역으로 들어간다. 단지 핀은 좌표가 모이면
+      이 지도 위에 얹는다(estate.apt_complex).
+
+      지도 백엔드(mapservice-rest)와 같은 방식으로 **SQL 에서 FeatureCollection 을 조립**해
+      geojson 텍스트 한 칸으로 돌려준다.
+
+      **경계를 그대로 내보내지 말 것** — 전국 시군구 원본이 37MB 다. 단순화(0.005)하면 791KB,
+      좌표를 5자리로 줄이면 더 작아진다(실측). 화면에서 보이는 차이는 없다.
+      응답은 gzip 으로 나간다(server.compression).
+    -->
+    <!--
+      경계(geometry)와 집계(평균가)를 **따로** 읽는다.
+
+      합쳐서 한 번에 뽑았더니 서울 8.7초·전국 8.4초였다(2026-10-14 실측). 느린 쪽은 집계가 아니라
+      **경계 단순화**다 — 전국 시군구 원본이 37MB 라 매번 깎으면 그만큼 걸린다.
+      경계는 **기간과 무관하고 바뀌지도 않으므로** 서비스가 한 번만 읽어 캐시하고,
+      기간이 걸린 집계만 그때그때 읽어 합친다(FeatureCollection 조립은 Java 가 한다).
+    -->
+    <!--
+      시도 경계. 17개뿐이라 작지만, 전국을 한 화면에 담으므로 가장 거칠게 깎는다.
+    -->
+    <select id="selectBoundarySido" resultType="map">
+        select g.sido_cd as code,
+               g.sido_nm as name,
+               ST_AsGeoJSON(ST_SimplifyPreserveTopology(g.geom, #{tolerance}), 5) as geometry
+        from public.g_sido g
+        where g.geom is not null
+        order by g.sido_cd
+    </select>
+
+    <select id="selectBoundarySgg" resultType="map">
+        select g.sgg_cd as code,
+               g.sgg_nm as name,
+               ST_AsGeoJSON(ST_SimplifyPreserveTopology(g.geom, #{tolerance}), 5) as geometry
+        from public.g_sgg g
+        where g.geom is not null
+        <if test="sidoCd != null and sidoCd != ''">
+            and g.sgg_cd between #{sidoCd} || '000' and #{sidoCd} || '999'
+        </if>
+        order by g.sgg_cd
+    </select>
+
+    <select id="selectBoundaryEmd" resultType="map">
+        select g.emd_cd as code,
+               g.emd_nm as name,
+               ST_AsGeoJSON(ST_SimplifyPreserveTopology(g.geom, #{tolerance}), 5) as geometry
+        from public.g_emd g
+        where g.emd_cd like #{sggCd} || '%'
+          and g.geom is not null
+        order by g.emd_cd
+    </select>
+
+    <!--
+      시도별 평균가(기간 조건). **전국 전건을 읽으므로 느리다**(실측 4~5초) — 서비스가 기간별로
+      캐시하고 기동 직후 예열한다. 시도 코드는 sgg_cd 앞 2자리다.
+    -->
+    <select id="selectRegionStatsSido" resultType="map">
+        select substring(t.sgg_cd, 1, 2)  as code,
+               count(*)                   as deal_count,
+               round(avg(t.deal_amount))  as avg_amount,
+               round(avg(t.deal_amount / nullif(t.exclu_use_ar, 0)), 1) as avg_amount_per_m2
+        from estate.apt_trade t
+        where t.deal_amount is not null
+        <include refid="ymFilter"><property name="alias" value="t."/></include>
+        group by substring(t.sgg_cd, 1, 2)
+    </select>
+
+    <!-- 시군구별 평균가(기간 조건). 경계와 달리 기간마다 달라지므로 캐시하지 않는다. -->
+    <select id="selectRegionStatsSgg" resultType="map">
+        select t.sgg_cd                   as code,
+               count(*)                   as deal_count,
+               round(avg(t.deal_amount))  as avg_amount,
+               round(avg(t.deal_amount / nullif(t.exclu_use_ar, 0)), 1) as avg_amount_per_m2
+        from estate.apt_trade t
+        where t.deal_amount is not null
+        <if test="sidoCd != null and sidoCd != ''">
+            <!-- 앞 2자리를 자르면 인덱스를 못 타므로 코드 범위로 좁힌다 -->
+            and t.sgg_cd between #{sidoCd} || '000' and #{sidoCd} || '999'
+        </if>
+        <include refid="ymFilter"><property name="alias" value="t."/></include>
+        group by t.sgg_cd
+    </select>
+
+    <!--
+      읍면동별 평균가. 실거래의 sgg_cd || umd_cd 앞 8자리가 g_emd.emd_cd 와 맞는다
+      (2026-10-13 확인: 2,154개 중 2,141개 = 99.4%).
+    -->
+    <select id="selectRegionStatsEmd" resultType="map">
+        select substring(t.sgg_cd || t.umd_cd, 1, 8) as code,
+               count(*)                   as deal_count,
+               round(avg(t.deal_amount))  as avg_amount,
+               round(avg(t.deal_amount / nullif(t.exclu_use_ar, 0)), 1) as avg_amount_per_m2
+        from estate.apt_trade t
+        where t.sgg_cd = #{sggCd}
+          and t.umd_cd is not null
+          and t.deal_amount is not null
+        <include refid="ymFilter"><property name="alias" value="t."/></include>
+        group by substring(t.sgg_cd || t.umd_cd, 1, 8)
+    </select>
+
+    <!--
+      ───────────────────────────── 지도 단지 핀 ─────────────────────────────
+      호갱노노식 핀이다. 좌표는 실거래 원천에 없어 따로 모아 둔 `estate.apt_complex` 에서 읽는다.
+
+      **표가 아직 없을 수 있다**(DDL 은 담당자가 실행한다) — 그래서 서비스가 먼저 존재를 확인하고
+      없으면 이 쿼리를 아예 부르지 않는다(빈 결과 + 안내로 답한다).
+    -->
+    <select id="existsComplexTable" resultType="string">
+        select to_regclass('estate.apt_complex')::text
+    </select>
+
+    <!-- 좌표 수집 진행률. 화면이 "핀이 왜 없는지"를 숫자로 알려 주는 데 쓴다(44,581개 중 N개). -->
+    <select id="selectComplexGeocodeStats" resultType="map">
+        select count(*)                                        as total,
+               count(*) filter (where geom is not null)         as geocoded,
+               count(*) filter (where geocode_status = 'FAILED') as failed
+        from estate.apt_complex
+    </select>
+
+    <!--
+      화면 영역(bbox, EPSG:3857) 안의 단지 핀 + 그 기간의 평균 거래가.
+
+      **두 단계로 나눠 읽는다.** 먼저 bbox 로 단지를 limit 개까지 고르고(gist 인덱스),
+      그 단지들이 속한 시군구에서만 거래를 묶는다. 거래를 단지별로 하나씩 조회하면
+      단지 300개 × 100ms 가 되므로 그렇게 하지 말 것 — `apt_seq` 에는 인덱스가 없고
+      (sgg_cd, ...) 인덱스만 있어 **시군구 단위로 한 번에 묶는 쪽이 빠르다**.
+    -->
+    <select id="selectComplexPins" resultType="map">
+        with picked as (
+            select c.apt_seq, c.apt_nm, c.sgg_cd, c.umd_nm, c.build_year,
+                   c.lon, c.lat, c.trade_count
+            from estate.apt_complex c
+            where c.geom is not null
+              and ST_Intersects(c.geom, ST_MakeEnvelope(#{minX}, #{minY}, #{maxX}, #{maxY}, 3857))
+            order by c.trade_count desc
+            limit #{limit}
+        ),
+        summed as (
+            select t.apt_seq,
+                   count(*)                   as deal_count,
+                   round(avg(t.deal_amount))  as avg_amount,
+                   round(avg(t.deal_amount / nullif(t.exclu_use_ar, 0)), 1) as avg_amount_per_m2,
+                   round(min(t.exclu_use_ar), 1) as area_min,
+                   round(max(t.exclu_use_ar), 1) as area_max
+            from estate.apt_trade t
+            where t.sgg_cd in (select distinct sgg_cd from picked)
+              and t.apt_seq in (select apt_seq from picked)
+              and t.deal_amount is not null
+            <include refid="ymFilter"><property name="alias" value="t."/></include>
+            group by t.apt_seq
+        )
+        select p.apt_seq, p.apt_nm, p.sgg_cd, p.umd_nm, p.build_year, p.lon, p.lat,
+               p.trade_count,
+               s.deal_count, s.avg_amount, s.avg_amount_per_m2, s.area_min, s.area_max
+        from picked p
+        left join summed s on s.apt_seq = p.apt_seq
+        order by p.trade_count desc
+    </select>
+
+    <!--
+      ─────────────────────────── 단지(아파트) 단위 조회 ───────────────────────────
+      호갱노노식 단지 패널(평형 선택 · 최근 실거래 평균 · 추세 · 거래 목록)에 쓰는 것들이다.
+
+      **단지 키는 `apt_seq`(예: 11680-218) 이고 앞 5자리가 시군구 코드다.**
+      apt_seq 에는 인덱스가 없으므로 **반드시 sgg_cd 조건을 함께** 건다(앞 5자리를 잘라 넣는다).
+      그래야 (sgg_cd, ...) 인덱스로 그 시군구만 읽는다(실측 134ms). 읍면동까지 주면 더 좁아진다.
+      sgg_cd 없이 apt_seq 만으로 조회하면 990만 건을 전부 훑는다 — 그렇게 쓰지 말 것.
+
+      **평형은 전용면적 기준이다.** 원천에 공급면적이 없어 분양 평형(호갱노노의 "24평")과
+      다를 수 있다 — 화면에서 "전용 OO㎡"를 함께 보여 준다. 3.3058㎡ = 1평.
+    -->
+    <sql id="complexScope">
+        where t.sgg_cd = #{sggCd}
+          and t.apt_seq = #{aptSeq}
+        <if test="umdNm != null and umdNm != ''">
+            and t.umd_nm = #{umdNm}
+        </if>
+    </sql>
+
+    <!-- 단지 목록(지역 안에서). 단지명 일부로 찾을 수 있다. -->
+    <select id="selectComplexes" resultType="map">
+        select t.apt_seq,
+               t.apt_nm,
+               t.umd_nm,
+               min(t.jibun)                                as jibun,
+               max(t.build_year)                           as build_year,
+               count(*)                                    as deal_count,
+               max(t.deal_year * 100 + t.deal_month)       as last_ym,
+               round(avg(t.deal_amount))                   as avg_amount
+        from estate.apt_trade t
+        where t.sgg_cd = #{sggCd}
+        <if test="umdNm != null and umdNm != ''">
+            and t.umd_nm = #{umdNm}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            and t.apt_nm ilike '%' || #{keyword} || '%'
+        </if>
+        group by t.apt_seq, t.apt_nm, t.umd_nm
+        order by count(*) desc
+        limit #{limit}
+    </select>
+
+    <!-- 단지 기본 정보. 주소·준공연도·거래 기간은 거래 기록에서 뽑는다(원천에 단지 표가 없다). -->
+    <select id="selectComplexSummary" resultType="map">
+        select t.apt_seq,
+               max(t.apt_nm)                          as apt_nm,
+               max(t.umd_nm)                          as umd_nm,
+               min(t.jibun)                           as jibun,
+               max(t.road_nm)                         as road_nm,
+               max(t.build_year)                      as build_year,
+               count(*)                               as deal_count,
+               min(t.deal_year * 100 + t.deal_month)  as first_ym,
+               max(t.deal_year * 100 + t.deal_month)  as last_ym,
+               count(distinct t.apt_dong) filter (where t.apt_dong is not null and t.apt_dong <![CDATA[<>]]> '') as dong_count
+        from estate.apt_trade t
+        <include refid="complexScope"/>
+        group by t.apt_seq
+    </select>
+
+    <!--
+      평형별 요약. 한 번 읽어 집계와 "그 평형의 가장 최근 거래"를 함께 만든다.
+      (단지 한 곳의 행만 다루므로 CTE 를 써도 가볍다)
+    -->
+    <select id="selectComplexAreas" resultType="map">
+        with rows as (
+            select round(t.exclu_use_ar / 3.3058) as pyeong,
+                   t.exclu_use_ar, t.deal_amount, t.floor,
+                   t.deal_year, t.deal_month, t.deal_day
+            from estate.apt_trade t
+            <include refid="complexScope"/>
+        ),
+        agg as (
+            select pyeong,
+                   count(*)                  as deal_count,
+                   round(avg(deal_amount))   as avg_amount,
+                   min(exclu_use_ar)         as area_min,
+                   max(exclu_use_ar)         as area_max
+            from rows group by pyeong
+        ),
+        latest as (
+            select distinct on (pyeong)
+                   pyeong,
+                   deal_amount                       as last_amount,
+                   deal_year * 100 + deal_month      as last_ym,
+                   floor                             as last_floor
+            from rows
+            order by pyeong, deal_year desc, deal_month desc, deal_day desc
+        )
+        select a.pyeong, a.deal_count, a.avg_amount, a.area_min, a.area_max,
+               l.last_amount, l.last_ym, l.last_floor
+        from agg a join latest l on l.pyeong = a.pyeong
+        order by a.pyeong
+    </select>
+
+    <!-- 단지(평형) 월별 매매 추세. 평형을 주지 않으면 단지 전체다. -->
+    <select id="selectComplexMonthly" resultType="map">
+        select t.deal_year, t.deal_month,
+               t.deal_year * 100 + t.deal_month as ym,
+               count(*)                                                  as deal_count,
+               round(avg(t.deal_amount))                                 as avg_amount,
+               percentile_cont(0.5) within group (order by t.deal_amount) as median_amount,
+               min(t.deal_amount)                                        as min_amount,
+               max(t.deal_amount)                                        as max_amount,
+               round(avg(t.exclu_use_ar), 2)                             as avg_area,
+               round(avg(t.deal_amount / nullif(t.exclu_use_ar, 0)), 1)   as avg_amount_per_m2
+        from estate.apt_trade t
+        <include refid="complexScope"/>
+        <if test="pyeong != null">
+            and round(t.exclu_use_ar / 3.3058) = #{pyeong}
+        </if>
+        <include refid="ymFilter"><property name="alias" value="t."/></include>
+        group by t.deal_year, t.deal_month
+        order by ym
+    </select>
+
+    <!-- 단지(평형) 월별 전월세. 전세 = 월세가 0(다른 조회와 같은 기준). -->
+    <select id="selectComplexRentMonthly" resultType="map">
+        select t.deal_year, t.deal_month,
+               t.deal_year * 100 + t.deal_month as ym,
+               count(*)                                                               as deal_count,
+               count(*) filter (where coalesce(t.monthly_rent, 0) = 0)                 as jeonse_count,
+               count(*) filter (where coalesce(t.monthly_rent, 0) &gt; 0)              as wolse_count,
+               round(avg(t.deposit) filter (where coalesce(t.monthly_rent, 0) = 0))    as avg_jeonse_deposit,
+               round(avg(t.deposit) filter (where coalesce(t.monthly_rent, 0) &gt; 0)) as avg_wolse_deposit,
+               round(avg(t.monthly_rent) filter (where coalesce(t.monthly_rent, 0) &gt; 0)) as avg_monthly_rent,
+               round(avg(t.exclu_use_ar), 2)                                          as avg_area
+        from estate.apt_rent t
+        where t.sgg_cd = #{sggCd}
+          and t.apt_seq = #{aptSeq}
+        <if test="umdNm != null and umdNm != ''">
+            and t.umd_nm = #{umdNm}
+        </if>
+        <if test="pyeong != null">
+            and round(t.exclu_use_ar / 3.3058) = #{pyeong}
+        </if>
+        <include refid="ymFilter"><property name="alias" value="t."/></include>
+        group by t.deal_year, t.deal_month
+        order by ym
+    </select>
+
+    <!-- 단지(평형) 최근 거래 목록. -->
+    <select id="selectComplexTrades" resultType="map">
+        select t.deal_year, t.deal_month, t.deal_day,
+               t.exclu_use_ar, t.floor, t.apt_dong,
+               round(t.exclu_use_ar / 3.3058) as pyeong,
+               t.deal_amount, t.dealing_gbn, t.cdeal_type,
+               round(t.deal_amount / nullif(t.exclu_use_ar, 0), 1) as amount_per_m2
+        from estate.apt_trade t
+        <include refid="complexScope"/>
+        <if test="pyeong != null">
+            and round(t.exclu_use_ar / 3.3058) = #{pyeong}
+        </if>
+        order by t.deal_year desc, t.deal_month desc, t.deal_day desc, t.deal_amount desc
+        limit #{limit}
+    </select>
+
     <select id="selectTrades" resultType="map">
         select t.sgg_cd,
                coalesce(g.sgg_nm, t.sgg_cd) as sgg_nm,
