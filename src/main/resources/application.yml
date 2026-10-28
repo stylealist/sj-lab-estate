@@ -23,7 +23,10 @@ estate:
     url: ${ESTATE_DB_URL:}
     username: ${ESTATE_DB_USERNAME:}
     password: ${ESTATE_DB_PASSWORD:}
-    pool-size: ${ESTATE_DB_POOL_SIZE:5}
+    # 5 로 두면 **무거운 집계(전국 평균·경계)가 풀을 다 쓰는 순간 핀 조회가 5초 만에
+    # 타임아웃**해 화면에 "부동산 데이터를 조회하지 못했습니다"가 뜬다(2026-10-22 실측
+    # estate-pool total=5 active=5). 조회 전용이라 넉넉히 둔다.
+    pool-size: ${ESTATE_DB_POOL_SIZE:16}
 
 mybatis:
   mapper-locations: classpath:mapper/*.xml

@@ -210,6 +210,28 @@ public class EstateController {
     }
 
     /**
+     * 고른 단지의 테두리(연속지적도 필지, GeoJSON Feature).
+     *
+     * <p>핀만 있으면 단지가 어디까지인지 알 수 없어 호갱노노처럼 테두리를 함께 그린다.
+     * <b>핀 응답에 넣지 않고 따로 부른다</b> — 폴리곤은 단지 하나가 수십 KB 라
+     * 화면에 보이는 300개를 통째로 보내면 응답이 수 MB 가 된다.
+     *
+     * <p>아직 못 받았으면 404 가 아니라 <b>{@code available:false}</b> 로 답한다
+     * (테두리가 없어도 핀·팝업은 정상이어야 한다).
+     */
+    @GetMapping(value = "/{propertyType}/complexes/{aptSeq}/boundary", produces = "application/json")
+    public ResponseEntity<String> complexBoundary(
+            @PathVariable String propertyType,
+            @PathVariable String aptSeq,
+            @RequestParam(required = false) String umdNm) {
+        checkPropertyType(propertyType);
+        return ResponseEntity.ok()
+                // 테두리는 바뀌지 않는다 — 넉넉히 들고 있게 한다.
+                .header("Cache-Control", "public, max-age=3600")
+                .body(estateService.getComplexBoundary(aptSeq, umdNm));
+    }
+
+    /**
      * `bbox=minX,minY,maxX,maxY`(EPSG:3857, 지도 뷰와 같은 좌표계)를 숫자 4개로 바꾼다.
      * 지도 레이어(mapservice-rest)와 같은 형식·같은 좌표계로 맞춘 것이다.
      */

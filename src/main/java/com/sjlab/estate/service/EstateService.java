@@ -324,11 +324,17 @@ public class EstateService {
             }
         }
 
+        // **화면이 쓰는 기간으로 예열한다**(2026-10-28). 기간 없이 예열하면 경계만 캐시에 남고
+        // 화면이 부르는 키(기간 포함)는 비어 있어, 결국 사용자가 집계를 기다렸다.
+        int[] period = defaultPeriod();
+        Integer fromYm = period == null ? null : period[0];
+        Integer toYm = period == null ? null : period[1];
+
         long started = System.currentTimeMillis();
         int done = 0;
         for (String sidoCd : sidoCodes) {
             try {
-                getMapRegionsSgg(sidoCd, null, null);
+                getMapRegionsSgg(sidoCd, fromYm, toYm);
                 done++;
                 Thread.sleep(500L);
             } catch (InterruptedException e) {
@@ -343,6 +349,27 @@ public class EstateService {
     }
 
     /**
+     * 화면 기본 기간(가장 최근 달부터 12개월). 프론트 {@code buildMonthOptions} 와 같은 규칙이라
+     * 예열한 캐시가 실제 호출과 맞아떨어진다. 거래가 없으면 {@code null}.
+     */
+    private int[] defaultPeriod() {
+        Integer latest = periodBound(mapper(), TRADE_TABLE, true);
+        if (latest == null) {
+            return null;
+        }
+        int toYm = latest;
+        int year = toYm / 100;
+        int month = toYm % 100;
+        // 11개월 뒤로 — 최근 달을 포함해 12개월이 된다
+        month -= 11;
+        while (month <= 0) {
+            month += 12;
+            year -= 1;
+        }
+        return new int[] {year * 100 + month, toYm};
+    }
+
+    /**
      * 전국 시도 집계를 화면 기본 기간으로 미리 계산해 둔다.
      *
      * <p>화면 기본값은 "가장 최근 달부터 12개월"이다(프론트 `buildMonthOptions`). 그 조합을 미리
@@ -351,20 +378,12 @@ public class EstateService {
      */
     private void warmUpSidoStats() {
         try {
-            Integer latest = periodBound(mapper(), TRADE_TABLE, true);
-            if (latest == null) {
+            int[] period = defaultPeriod();
+            if (period == null) {
                 return;
             }
-            int toYm = latest;
-            int year = toYm / 100;
-            int month = toYm % 100;
-            // 11개월 뒤로 — 최근 달을 포함해 12개월이 된다
-            month -= 11;
-            while (month <= 0) {
-                month += 12;
-                year -= 1;
-            }
-            int fromYm = year * 100 + month;
+            int fromYm = period[0];
+            int toYm = period[1];
             long started = System.currentTimeMillis();
             sidoStatsCache.put("sido:" + fromYm + "-" + toYm,
                     mapper().selectRegionStatsSido(fromYm, toYm));
@@ -459,6 +478,38 @@ public class EstateService {
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /**
+     * 시군구·읍면동 지도 응답(GeoJSON 문자열) 캐시.
+     *
+     * <p><b>경계만 캐시해서는 부족했다</b>(2026-10-28). 집계는 호출마다 DB 를 읽어, 지도를 옮길
+     * 때마다 경기도 시군구가 1.1초였다(서울 0.5초) — `stats=0` 은 시도에만 있어 "경계만" 받는
+     * 호출도 같은 값을 냈다. 집계는 수집이 돌 때만 바뀌므로 <b>조립까지 끝낸 응답을 그대로</b>
+     * 들고 있다가 다시 내준다(실측 1.1초 → 수 ms). 기간이 키에 들어가 다른 기간은 따로 담긴다.
+     */
+    private final java.util.Map<String, CachedJson> mapJsonCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 지도 응답 캐시 수명. 지역 목록 캐시와 같은 기준이다(수집이 돌 때만 값이 바뀐다). */
+    private static final long MAP_JSON_TTL_MS = 6L * 60 * 60 * 1000;
+
+    private static final class CachedJson {
+        private final String json;
+        private final long madeAt;
+
+        private CachedJson(String json) {
+            this.json = json;
+            this.madeAt = System.currentTimeMillis();
+        }
+
+        private boolean fresh() {
+            return fresh(MAP_JSON_TTL_MS);
+        }
+
+        private boolean fresh(long ttlMs) {
+            return System.currentTimeMillis() - madeAt < ttlMs;
+        }
+    }
+
+    /**
      * 전국 시도 경계 + 평균가(GeoJSON). 지도를 끝까지 줌아웃했을 때 쓴다.
      *
      * <p><b>집계가 없으면 기다리지 않는다.</b> 전국 평균은 990만 건을 모두 읽어야 나와서 28초가
@@ -507,26 +558,67 @@ public class EstateService {
     /** 시군구 경계 + 평균가(GeoJSON). 시도를 주면 그 안만 — 전국은 경계가 크다. */
     public String getMapRegionsSgg(String sidoCd, Integer fromYm, Integer toYm) {
         boolean hasSido = sidoCd != null && !sidoCd.isBlank();
+        String cacheKey = "sgg:" + (hasSido ? sidoCd : "ALL") + ":" + fromYm + "-" + toYm;
+        CachedJson cached = mapJsonCache.get(cacheKey);
+        if (cached != null && cached.fresh()) {
+            return cached.json;
+        }
         double tolerance = hasSido ? TOLERANCE_SGG_SIDO : TOLERANCE_SGG_ALL;
         List<Map<String, Object>> boundaries = boundaryCache.computeIfAbsent(
                 "sgg:" + (hasSido ? sidoCd : "ALL"),
                 key -> mapper().selectBoundarySgg(hasSido ? sidoCd : null, tolerance));
         List<Map<String, Object>> stats = mapper().selectRegionStatsSgg(hasSido ? sidoCd : null, fromYm, toYm);
-        return toFeatureCollection(boundaries, stats, "sgg");
+        String json = toFeatureCollection(boundaries, stats, "sgg");
+        mapJsonCache.put(cacheKey, new CachedJson(json));
+        return json;
     }
 
     /** 한 시군구 안의 읍면동 경계 + 평균가(GeoJSON). */
     public String getMapRegionsEmd(String sggCd, Integer fromYm, Integer toYm) {
+        String cacheKey = "emd:" + sggCd + ":" + fromYm + "-" + toYm;
+        CachedJson cached = mapJsonCache.get(cacheKey);
+        if (cached != null && cached.fresh()) {
+            return cached.json;
+        }
         List<Map<String, Object>> boundaries = boundaryCache.computeIfAbsent(
                 "emd:" + sggCd, key -> mapper().selectBoundaryEmd(sggCd, TOLERANCE_EMD));
         List<Map<String, Object>> stats = mapper().selectRegionStatsEmd(sggCd, fromYm, toYm);
-        return toFeatureCollection(boundaries, stats, "emd");
+        String json = toFeatureCollection(boundaries, stats, "emd");
+        mapJsonCache.put(cacheKey, new CachedJson(json));
+        return json;
     }
 
     // ── 지도 단지 핀 ─────────────────────────────────────────────────────
 
     /** 단지 핀 1회 조회 상한. 호갱노노처럼 라벨을 달기 때문에 너무 많으면 글자가 겹친다. */
     private static final int PIN_LIMIT_MAX = 500;
+
+    /**
+     * 좌표 진행률(전체·받은 수) 캐시.
+     *
+     * <p>이 숫자는 화면 안내("44,581개 중 N개")에만 쓰는데 <b>핀을 부를 때마다 단지 4.4만 행을
+     * 다시 셌다</b>(실측 55ms) — 지도를 옮길 때마다 붙는 비용이었다(2026-10-28). 수집이 돌 때만
+     * 바뀌는 값이라 1분 들고 있어도 화면 안내가 늦지 않는다.
+     */
+    private volatile long[] complexProgress = null;
+    private volatile long complexProgressAt = 0L;
+    private static final long PROGRESS_TTL_MS = 60_000L;
+
+    /**
+     * 핀 응답(GeoJSON 문자열) 캐시.
+     *
+     * <p>화면은 bbox 를 1km 격자로 끊어 묻기 때문에(프론트 {@code pinBboxKey}) 같은 영역을
+     * 되돌아오면 <b>같은 요청</b>이 된다. 조립까지 끝낸 응답을 들고 있다가 그대로 내준다.
+     * 좌표가 아직 준비 중인 응답은 담지 않는다 — 진행률이 굳어 "준비 중"이 멈춰 보인다.
+     */
+    private final java.util.Map<String, CachedJson> pinJsonCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 핀 캐시 수명. 기간이 키에 들어가므로 짧게 둬도 같은 화면을 오가는 동안은 맞는다. */
+    private static final long PIN_JSON_TTL_MS = 10L * 60 * 1000;
+
+    /** 핀 캐시 항목 수 상한(응답이 100KB 대라 무한정 담을 수 없다). 넘으면 비우고 다시 쌓는다. */
+    private static final int PIN_JSON_CACHE_MAX = 300;
 
     /**
      * 단지 마스터 표가 있는지. <b>없을 수 있다</b> — DDL 은 DB 담당자가 실행하는 규칙이라
@@ -537,16 +629,72 @@ public class EstateService {
     private volatile long complexTableCheckedAt = 0L;
 
     private boolean complexTableReady() {
+        // **한 번 있다고 확인했으면 다시 묻지 않는다.** 표는 사라지지 않는데, 종전에는 매 호출마다
+        // 다시 묻고 **오류가 나면 "없음"으로 뒤집었다** — DB 연결이 잠깐 끊기면 화면에 "단지 좌표
+        // 표를 만들면 수집이 시작됩니다"가 뜨고 핀이 사라졌다(2026-10-22 실제 발생).
+        if (complexTableExists) {
+            return true;
+        }
         long now = System.currentTimeMillis();
-        if (complexTableExists || now - complexTableCheckedAt > 60_000L) {
+        if (now - complexTableCheckedAt > 60_000L) {
             try {
                 complexTableExists = mapper().existsComplexTable() != null;
             } catch (RuntimeException e) {
-                complexTableExists = false;
+                // 연결 문제와 "표 없음"은 구분할 수 없다 — 다음 확인 때 다시 본다(값은 그대로 false).
+                log.info("단지 표 확인 실패: {}", e.getClass().getSimpleName());
             }
             complexTableCheckedAt = now;
         }
         return complexTableExists;
+    }
+
+    /**
+     * 테두리 컬럼이 있는지. 좌표 표보다 <b>나중에 더해진 컬럼</b>이라 없을 수 있다 —
+     * 표 확인과 같은 방식으로 60초마다 다시 본다(컬럼이 생기면 재기동 없이 반영된다).
+     */
+    private volatile boolean boundaryColumnExists = false;
+    private volatile long boundaryColumnCheckedAt = 0L;
+
+    private boolean boundaryColumnReady() {
+        if (!complexTableReady()) {
+            return false;
+        }
+        // 표 확인과 같은 이유로 **한 번 확인하면 뒤집지 않는다**(컬럼도 사라지지 않는다).
+        if (boundaryColumnExists) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (now - boundaryColumnCheckedAt > 60_000L) {
+            try {
+                boundaryColumnExists = mapper().existsComplexBoundaryColumn() != null;
+            } catch (RuntimeException e) {
+                log.info("테두리 컬럼 확인 실패: {}", e.getClass().getSimpleName());
+            }
+            boundaryColumnCheckedAt = now;
+        }
+        return boundaryColumnExists;
+    }
+
+    /**
+     * 고른 단지의 테두리(GeoJSON Feature).
+     *
+     * <p>아직 못 받았거나 컬럼이 없으면 <b>오류가 아니라 비어 있다고</b> 답한다 — 테두리가 없어도
+     * 핀과 팝업은 그대로 동작해야 하고, 화면이 "없음"을 조용히 넘길 수 있어야 한다.
+     */
+    public String getComplexBoundary(String aptSeq, String umdNm) {
+        if (!boundaryColumnReady()) {
+            return "{\"available\":false,\"reason\":\"NOT_READY\",\"feature\":null}";
+        }
+        Map<String, Object> row = mapper().selectComplexBoundary(sggCdOf(aptSeq), aptSeq);
+        Object geometry = row == null ? null : row.get("geometry");
+        if (geometry == null) {
+            return "{\"available\":false,\"reason\":\"NO_BOUNDARY\",\"feature\":null}";
+        }
+        // area_m2 는 이 테두리가 덮는 넓이다(화면에서 "단지 영역 약 N㎡"로 보여 준다).
+        // 테두리 자체가 건물 외곽을 두르고 다듬은 값이라 **법정 대지면적이 아니라 추정치**다.
+        return "{\"available\":true,\"feature\":{\"type\":\"Feature\",\"geometry\":" + geometry
+                + ",\"properties\":{\"apt_seq\":\"" + escape(aptSeq) + "\""
+                + ",\"area_m2\":" + numberOrNull(row, "area_m2") + "}}}";
     }
 
     /**
@@ -564,54 +712,60 @@ public class EstateService {
                     + "\"reason\":\"NO_TABLE\",\"message\":\"단지 좌표 표가 아직 만들어지지 않았습니다.\"}";
         }
 
-        long total = 0;
-        long geocoded = 0;
+        // bbox 는 화면이 1km 격자로 끊어 보내므로 그대로 키로 써도 같은 영역이 같은 키가 된다.
+        String cacheKey = Math.round(minX) + "," + Math.round(minY) + "," + Math.round(maxX) + ","
+                + Math.round(maxY) + ":" + fromYm + "-" + toYm + ":" + capped;
+        CachedJson cachedPins = pinJsonCache.get(cacheKey);
+        if (cachedPins != null && cachedPins.fresh(PIN_JSON_TTL_MS)) {
+            return cachedPins.json;
+        }
+
+        long[] progress = complexProgressCached();
+        long total = progress[0];
+        long geocoded = progress[1];
+
+        // **Feature 배열은 DB 가 만들어 준다**(2026-10-28) — 행 목록을 Map 으로 옮기는 비용이
+        // 단지 381개에 400ms 였다(DB 쿼리 자체는 62ms). 받은 문자열에 머리말만 붙인다.
+        String features = geocoded == 0
+                ? "[]"
+                : mapper().selectComplexPins(minX, minY, maxX, maxY, fromYm, toYm, capped);
+        if (features == null || features.isBlank()) {
+            features = "[]";
+        }
+
+        String json = "{\"type\":\"FeatureCollection\",\"coordinates_ready\":" + (geocoded > 0)
+                + ",\"complex_total\":" + total
+                + ",\"complex_geocoded\":" + geocoded
+                + ",\"features\":" + features + "}";
+
+        // 준비 중인 응답은 담지 않는다 — 진행률이 굳어 화면 안내가 멈춘 것처럼 보인다.
+        if (geocoded > 0) {
+            if (pinJsonCache.size() >= PIN_JSON_CACHE_MAX) {
+                pinJsonCache.clear();
+            }
+            pinJsonCache.put(cacheKey, new CachedJson(json));
+        }
+        return json;
+    }
+
+    /** 좌표 진행률. 1분 안에 다시 물으면 들고 있던 값을 준다. */
+    private long[] complexProgressCached() {
+        long[] cached = complexProgress;
+        if (cached != null && System.currentTimeMillis() - complexProgressAt < PROGRESS_TTL_MS) {
+            return cached;
+        }
+        long[] fresh = cached == null ? new long[] {0, 0} : cached;
         try {
             Map<String, Object> progress = mapper().selectComplexGeocodeStats();
             if (progress != null) {
-                total = asLong(progress.get("total"));
-                geocoded = asLong(progress.get("geocoded"));
+                fresh = new long[] {asLong(progress.get("total")), asLong(progress.get("geocoded"))};
             }
         } catch (RuntimeException e) {
             log.info("좌표 진행률을 읽지 못했다: {}", e.getClass().getSimpleName());
         }
-
-        List<Map<String, Object>> pins = geocoded == 0
-                ? List.of()
-                : mapper().selectComplexPins(minX, minY, maxX, maxY, fromYm, toYm, capped);
-
-        StringBuilder sb = new StringBuilder(pins.size() * 256 + 256);
-        sb.append("{\"type\":\"FeatureCollection\",\"coordinates_ready\":").append(geocoded > 0)
-                .append(",\"complex_total\":").append(total)
-                .append(",\"complex_geocoded\":").append(geocoded)
-                .append(",\"features\":[");
-        boolean first = true;
-        for (Map<String, Object> pin : pins) {
-            Object lon = pin.get("lon");
-            Object lat = pin.get("lat");
-            if (lon == null || lat == null) {
-                continue;
-            }
-            if (!first) {
-                sb.append(',');
-            }
-            first = false;
-            sb.append("{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[")
-                    .append(lon).append(',').append(lat).append("]},\"properties\":{")
-                    .append("\"apt_seq\":\"").append(escape(String.valueOf(pin.get("apt_seq"))))
-                    .append("\",\"apt_nm\":\"").append(escape(String.valueOf(pin.get("apt_nm"))))
-                    .append("\",\"umd_nm\":\"").append(escape(String.valueOf(pin.get("umd_nm"))))
-                    .append("\",\"sgg_cd\":\"").append(escape(String.valueOf(pin.get("sgg_cd"))))
-                    .append("\",\"build_year\":").append(numberOrNull(pin, "build_year"))
-                    .append(",\"deal_count\":").append(numberOrNull(pin, "deal_count"))
-                    .append(",\"avg_amount\":").append(numberOrNull(pin, "avg_amount"))
-                    .append(",\"avg_amount_per_m2\":").append(numberOrNull(pin, "avg_amount_per_m2"))
-                    .append(",\"area_min\":").append(numberOrNull(pin, "area_min"))
-                    .append(",\"area_max\":").append(numberOrNull(pin, "area_max"))
-                    .append("}}");
-        }
-        sb.append("]}");
-        return sb.toString();
+        complexProgress = fresh;
+        complexProgressAt = System.currentTimeMillis();
+        return fresh;
     }
 
     private long asLong(Object value) {

@@ -117,8 +117,18 @@ public interface EstateMapper {
     /** 좌표 수집 진행률(전체·받은 수·실패). */
     Map<String, Object> selectComplexGeocodeStats();
 
-    /** 화면 영역(EPSG:3857) 안의 단지 핀 + 기간 평균가. */
-    List<Map<String, Object>> selectComplexPins(
+    /** 테두리 컬럼이 있는지(없으면 null). 좌표 표보다 나중에 더해진 컬럼이다. */
+    String existsComplexBoundaryColumn();
+
+    /** 고른 단지 하나의 테두리(연속지적도 필지, EPSG:4326 GeoJSON). */
+    Map<String, Object> selectComplexBoundary(
+            @Param("sggCd") String sggCd, @Param("aptSeq") String aptSeq);
+
+    /**
+     * 화면 영역(EPSG:3857) 안의 단지 핀 + 기간 평균가. <b>Feature 배열 JSON 문자열</b>을 돌려준다 —
+     * 행 목록을 Map 으로 옮기는 것만으로 단지 381개에 400ms 가 들었다(2026-10-28).
+     */
+    String selectComplexPins(
             @Param("minX") double minX,
             @Param("minY") double minY,
             @Param("maxX") double maxX,

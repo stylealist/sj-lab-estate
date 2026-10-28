@@ -25,7 +25,7 @@ public class EstateDataSourceConfig {
     private String url = "";
     private String username = "";
     private String password = "";
-    private int poolSize = 5;
+    private int poolSize = 16;
 
     @Bean
     // 빈 문자열이면 만들지 않는다. @ConditionalOnProperty 는 "값이 빈 문자열"도 있는 것으로 보기 때문에
@@ -39,7 +39,14 @@ public class EstateDataSourceConfig {
         dataSource.setMaximumPoolSize(poolSize);
         dataSource.setPoolName("estate-pool");
         dataSource.setReadOnly(true);
-        dataSource.setConnectionTimeout(5_000);
+        // 5초는 무거운 집계와 겹칠 때 너무 짧다 — 기다렸다 받는 쪽이 낫다(실패하면 화면이 빈다).
+        dataSource.setConnectionTimeout(10_000);
+        // **죽은 연결을 미리 걸러낸다.** DB 가 NodePort 로 멀리 있어 쉬는 연결이 중간에서 끊기는데,
+        // 그걸 그대로 꺼내 쓰면 조회가 간헐적으로 실패한다(2026-10-22 화면에서 핀이 사라졌다).
+        // 2분마다 살아 있는지 확인하고(keepalive), 10분이 지난 연결은 새것으로 바꾼다.
+        dataSource.setKeepaliveTime(120_000);
+        dataSource.setMaxLifetime(600_000);
+        dataSource.setValidationTimeout(3_000);
         return dataSource;
     }
 
