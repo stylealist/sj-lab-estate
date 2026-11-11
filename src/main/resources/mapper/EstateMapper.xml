@@ -504,26 +504,48 @@
     </sql>
 
     <!-- 단지 목록(지역 안에서). 단지명 일부로 찾을 수 있다. -->
+    <!--
+      단지 목록. **좌표(lon·lat)를 함께 준다**(2026-10-29) — 목록에서 단지를 고르면 지도가 그
+      자리로 가고 핀이 보이는 줌까지 당긴다. 좌표가 없으면 화면이 이동을 건너뛴다.
+
+      좌표는 **집계를 끝낸 뒤에 붙인다.** 거래 표에 바로 조인하면 거래 행마다(단지 하나에
+      수백 건) 조인이 일어난다. 집계 결과는 limit 개(최대 200)이고 apt_complex 의 기본키가
+      apt_seq 라, 그만큼만 기본키로 찾으면 된다.
+    -->
     <select id="selectComplexes" resultType="map">
-        select t.apt_seq,
-               t.apt_nm,
-               t.umd_nm,
-               min(t.jibun)                                as jibun,
-               max(t.build_year)                           as build_year,
-               count(*)                                    as deal_count,
-               max(t.deal_year * 100 + t.deal_month)       as last_ym,
-               round(avg(t.deal_amount))                   as avg_amount
-        from estate.apt_trade t
-        where t.sgg_cd = #{sggCd}
-        <if test="umdNm != null and umdNm != ''">
-            and t.umd_nm = #{umdNm}
-        </if>
-        <if test="keyword != null and keyword != ''">
-            and t.apt_nm ilike '%' || #{keyword} || '%'
-        </if>
-        group by t.apt_seq, t.apt_nm, t.umd_nm
-        order by count(*) desc
-        limit #{limit}
+        select g.apt_seq,
+               g.apt_nm,
+               g.umd_nm,
+               g.jibun,
+               g.build_year,
+               g.deal_count,
+               g.last_ym,
+               g.avg_amount,
+               c.lon,
+               c.lat
+        from (
+            select t.apt_seq,
+                   t.apt_nm,
+                   t.umd_nm,
+                   min(t.jibun)                                as jibun,
+                   max(t.build_year)                           as build_year,
+                   count(*)                                    as deal_count,
+                   max(t.deal_year * 100 + t.deal_month)       as last_ym,
+                   round(avg(t.deal_amount))                   as avg_amount
+            from estate.apt_trade t
+            where t.sgg_cd = #{sggCd}
+            <if test="umdNm != null and umdNm != ''">
+                and t.umd_nm = #{umdNm}
+            </if>
+            <if test="keyword != null and keyword != ''">
+                and t.apt_nm ilike '%' || #{keyword} || '%'
+            </if>
+            group by t.apt_seq, t.apt_nm, t.umd_nm
+            order by count(*) desc
+            limit #{limit}
+        ) g
+        left join estate.apt_complex c on c.apt_seq = g.apt_seq
+        order by g.deal_count desc
     </select>
 
     <!-- 단지 기본 정보. 주소·준공연도·거래 기간은 거래 기록에서 뽑는다(원천에 단지 표가 없다). -->
