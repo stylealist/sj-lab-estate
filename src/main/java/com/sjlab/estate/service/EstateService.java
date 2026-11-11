@@ -886,6 +886,12 @@ public class EstateService {
         return new ArrayList<>(mapper().selectComplexTrades(sggCdOf(aptSeq), aptSeq, umdNm, pyeong, limit));
     }
 
+    /** 단지(평형) 전월세 거래 목록. 매매 목록과 같은 모양으로 화면이 쓴다. */
+    public List<Map<String, Object>> getComplexRentTrades(
+            String aptSeq, String umdNm, Integer pyeong, int limit) {
+        return new ArrayList<>(mapper().selectComplexRentTrades(sggCdOf(aptSeq), aptSeq, umdNm, pyeong, limit));
+    }
+
     /** 지역별 평균 매매가 순위. 시도를 주면 그 시도 안에서만 순위를 낸다. */
     public List<Map<String, Object>> getTradeRanking(String sidoCd, Integer fromYm, Integer toYm, int limit) {
         return new ArrayList<>(mapper().selectTradeRanking(sidoCd, fromYm, toYm, limit));

@@ -343,6 +343,26 @@ public class EstateController {
         return items(estateService.getComplexTrades(aptSeq, umdNm, pyeong, size));
     }
 
+    /**
+     * 단지(평형) 전월세 거래 목록(2026-11-11).
+     *
+     * <p>매매 목록(`/trades`)과 **같은 파라미터·같은 상한**이다 — 화면이 두 목록을 같은 모양으로
+     * 그리고 탭만 바꾸기 때문이다. 상한을 500 으로 둔 이유도 같다(한 단지의 전체 기록이
+     * 그보다 많으면 화면이 "더 있습니다"를 알린다).
+     */
+    @GetMapping("/{propertyType}/complexes/{aptSeq}/rent/trades")
+    public Map<String, Object> complexRentTrades(
+            @PathVariable String propertyType,
+            @PathVariable String aptSeq,
+            @RequestParam(required = false) String umdNm,
+            @RequestParam(required = false) Integer pyeong,
+            @RequestParam(required = false) Integer limit) {
+        checkPropertyType(propertyType);
+        checkAptSeq(aptSeq);
+        int size = clamp(limit, 50, 1, 500, "limit");
+        return items(estateService.getComplexRentTrades(aptSeq, umdNm, pyeong, size));
+    }
+
     @GetMapping("/{propertyType}/trade/ranking")
     public Map<String, Object> tradeRanking(
             @PathVariable String propertyType,

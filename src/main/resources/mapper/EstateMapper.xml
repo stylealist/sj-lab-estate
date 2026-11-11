@@ -646,6 +646,33 @@
         order by ym
     </select>
 
+    <!--
+      단지(평형) 전월세 거래 목록(2026-11-11).
+
+      화면이 매매와 같은 모양으로 "거래 내역"을 쭉 보여 주므로 매매 목록과 **같은 정렬**
+      (최근 계약일 먼저)을 쓴다. 전월세 표에는 `apt_dong` 이 없어 동 정보는 담지 않는다.
+      전세·월세는 `monthly_rent = 0` 으로 가른다(이 프로젝트 공통 규칙).
+    -->
+    <select id="selectComplexRentTrades" resultType="map">
+        select t.deal_year, t.deal_month, t.deal_day,
+               t.exclu_use_ar, t.floor,
+               round(t.exclu_use_ar / 3.3058 / 0.75) as pyeong,
+               t.deposit, t.monthly_rent,
+               t.contract_term, t.contract_type,
+               t.pre_deposit, t.pre_monthly_rent
+        from estate.apt_rent t
+        where t.sgg_cd = #{sggCd}
+          and t.apt_seq = #{aptSeq}
+        <if test="umdNm != null and umdNm != ''">
+            and t.umd_nm = #{umdNm}
+        </if>
+        <if test="pyeong != null">
+            and round(t.exclu_use_ar / 3.3058 / 0.75) = #{pyeong}
+        </if>
+        order by t.deal_year desc, t.deal_month desc, t.deal_day desc, t.deposit desc
+        limit #{limit}
+    </select>
+
     <!-- 단지(평형) 최근 거래 목록. -->
     <select id="selectComplexTrades" resultType="map">
         select t.deal_year, t.deal_month, t.deal_day,

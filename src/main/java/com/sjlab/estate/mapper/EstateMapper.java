@@ -182,6 +182,14 @@ public interface EstateMapper {
             @Param("pyeong") Integer pyeong,
             @Param("limit") int limit);
 
+    /** 단지(평형) 전월세 거래 목록. */
+    List<Map<String, Object>> selectComplexRentTrades(
+            @Param("sggCd") String sggCd,
+            @Param("aptSeq") String aptSeq,
+            @Param("umdNm") String umdNm,
+            @Param("pyeong") Integer pyeong,
+            @Param("limit") int limit);
+
     /** 지역별 평균 매매가 순위(거래 10건 이상인 지역만). */
     List<Map<String, Object>> selectTradeRanking(
             @Param("sidoCd") String sidoCd,
