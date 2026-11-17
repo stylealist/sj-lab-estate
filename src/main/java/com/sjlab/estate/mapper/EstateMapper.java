@@ -141,6 +141,17 @@ public interface EstateMapper {
     // 단지 키는 apt_seq 이고 앞 5자리가 시군구 코드다. **인덱스가 없어 sgg_cd 를 반드시 함께**
     // 넘긴다(없으면 990만 건 전수 조회). 읍면동(umdNm)을 주면 더 좁아진다.
 
+    /**
+     * 전국 단지 이름 색인 — 검색창이 쓰는 원본. **전부 한 번에 읽는다.**
+     *
+     * <p>거래 표가 아니라 단지 표(`estate.apt_complex`, 44,616행)를 읽는다. 거래 표는 990만 행이고
+     * `apt_seq` 에 인덱스가 없어 전국 이름 검색이 불가능하다. 단지 표는 좌표까지 들고 있어(98.8%)
+     * 고른 단지로 지도를 바로 옮길 수 있다.
+     *
+     * <p>이름 부분검색은 인덱스를 못 타 전수 조회가 된다(실측 944ms). 그래서 키를 쳐 넣을 때마다
+     * DB 를 때리지 않고 서비스가 메모리에 색인을 두고 찾는다(6시간 캐시).
+     */
+    List<Map<String, Object>> selectComplexNameIndex();
     /** 지역 안의 단지 목록(거래 많은 순). 단지명 일부로 찾을 수 있다. */
     List<Map<String, Object>> selectComplexes(
             @Param("sggCd") String sggCd,
@@ -154,6 +165,19 @@ public interface EstateMapper {
 
     /** 평형별 요약(건수·평균·면적 범위 + 그 평형의 가장 최근 거래). 평형은 **전용면적** 기준. */
     List<Map<String, Object>> selectComplexAreas(
+            @Param("sggCd") String sggCd, @Param("aptSeq") String aptSeq, @Param("umdNm") String umdNm);
+
+    /**
+     * 매매 거래가 없는 단지의 기본 정보(전월세 표에서).
+     *
+     * <p>단지 표(44,616개) 중 3,053개는 전월세만 있다(2026-11-17 실측). 매매 표만 보면 그
+     * 단지는 "없는 단지"가 되어 상세가 404 였다 — 전국 검색에서 고를 수 있게 되며 드러났다.
+     */
+    Map<String, Object> selectComplexRentSummary(
+            @Param("sggCd") String sggCd, @Param("aptSeq") String aptSeq, @Param("umdNm") String umdNm);
+
+    /** 매매 거래가 없는 단지의 평형 목록(전월세 표에서). 키는 {@link #selectComplexAreas} 와 맞춘다. */
+    List<Map<String, Object>> selectComplexRentAreas(
             @Param("sggCd") String sggCd, @Param("aptSeq") String aptSeq, @Param("umdNm") String umdNm);
 
     /** 단지(평형) 월별 매매 추세. */

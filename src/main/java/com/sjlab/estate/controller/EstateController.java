@@ -282,6 +282,34 @@ public class EstateController {
         return items(estateService.getComplexes(sggCd, umdNm, keyword, size));
     }
 
+    /**
+     * 전국 단지 검색 — 이름 일부로 찾는다. 헤더 검색창이 쓴다.
+     *
+     * <p>{@code /complexes} 는 {@code sggCd} 가 필수라 **시군구를 먼저 골라야** 단지를 찾을 수
+     * 있었다. "래미안" 처럼 이름만 아는 경우를 받지 못했다.
+     *
+     * <p>경로가 {@code /complexes/{aptSeq}} 와 겹쳐 보이지만, Spring 은 **글자가 박힌 조각을
+     * 변수보다 먼저** 맞춘다(PathPatternParser). 게다가 `apt_seq` 는 "11680-218" 형태라
+     * "search" 와 겹치지 않는다. 경로를 바꿀 때 이 순서를 깨지 않도록 주의할 것.
+     *
+     * <p>응답은 좌표를 함께 주므로 화면이 고른 단지로 지도를 바로 옮길 수 있고, 같은 이름의
+     * 단지가 많아(36,168 / 44,616) 시군구·읍면동을 함께 담는다.
+     */
+    @GetMapping("/{propertyType}/complexes/search")
+    public Map<String, Object> complexSearch(
+            @PathVariable String propertyType,
+            @RequestParam(name = "q") String keyword,
+            @RequestParam(required = false) Integer limit) {
+        checkPropertyType(propertyType);
+        if (keyword == null || keyword.isBlank()) {
+            throw new BadRequestException("MISSING_PARAMETER", "q 는 필수입니다(단지명 일부, 2자 이상).");
+        }
+        if (keyword.length() > 40) {
+            throw new BadRequestException("INVALID_PARAMETER", "q 는 40자 이하여야 합니다.");
+        }
+        int size = clamp(limit, 20, 1, 50, "limit");
+        return items(estateService.searchComplexes(keyword, size));
+    }
     /** 단지 기본 정보 + 평형별 요약(평형은 **전용면적** 기준). */
     @GetMapping("/{propertyType}/complexes/{aptSeq}")
     public Map<String, Object> complexDetail(

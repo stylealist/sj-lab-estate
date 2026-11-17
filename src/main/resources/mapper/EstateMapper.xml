@@ -503,6 +503,19 @@
         </if>
     </sql>
 
+    <!--
+      전월세 표에서 같은 단지를 가리키는 조건. 컬럼 이름이 매매와 같아 내용은 같지만,
+      전월세 표에는 `apt_dong` 이 없어(동 정보 없음) 그 집계만 다르다.
+      **매매 거래가 한 건도 없는 단지**(44,616개 중 3,053개, 2026-11-17 실측)를 위해 쓴다.
+    -->
+    <sql id="complexRentScope">
+        where t.sgg_cd = #{sggCd}
+          and t.apt_seq = #{aptSeq}
+        <if test="umdNm != null and umdNm != ''">
+            and t.umd_nm = #{umdNm}
+        </if>
+    </sql>
+
     <!-- 단지 목록(지역 안에서). 단지명 일부로 찾을 수 있다. -->
     <!--
       단지 목록. **좌표(lon·lat)를 함께 준다**(2026-10-29) — 목록에서 단지를 고르면 지도가 그
@@ -596,6 +609,68 @@
         )
         select a.pyeong, a.deal_count, a.avg_amount, a.area_min, a.area_max,
                l.last_amount, l.last_ym, l.last_floor
+        from agg a join latest l on l.pyeong = a.pyeong
+        order by a.pyeong
+    </select>
+
+    <!--
+      매매 거래가 없는 단지의 **기본 정보**(전월세 표에서). 위 `selectComplexSummary` 와 키를
+      맞춰 두어 화면이 같은 코드로 그린다. 매매가 없으므로 `deal_count` 는 0 이고, 전월세 표에
+      `apt_dong` 이 없어 `dong_count` 도 0 이다.
+    -->
+    <select id="selectComplexRentSummary" resultType="map">
+        select t.apt_seq,
+               max(t.apt_nm)                          as apt_nm,
+               max(t.umd_nm)                          as umd_nm,
+               min(t.jibun)                           as jibun,
+               max(t.road_nm)                         as road_nm,
+               max(t.build_year)                      as build_year,
+               0                                      as deal_count,
+               count(*)                               as rent_count,
+               min(t.deal_year * 100 + t.deal_month)  as first_ym,
+               max(t.deal_year * 100 + t.deal_month)  as last_ym,
+               0                                      as dong_count
+        from estate.apt_rent t
+        <include refid="complexRentScope"/>
+        group by t.apt_seq
+    </select>
+
+    <!--
+      매매 거래가 없는 단지의 **평형 목록**(전월세 표에서). `selectComplexAreas` 와 키를 맞추되
+      금액은 매매가가 아니라 보증금이므로 `avg_amount` 를 비우고 `rent_count` 를 함께 준다
+      (화면이 "거래 N건" 을 전월세 건수로 바꿔 적는다).
+    -->
+    <select id="selectComplexRentAreas" resultType="map">
+        with rows as (
+            select round(t.exclu_use_ar / 3.3058 / 0.75) as pyeong,
+                   t.exclu_use_ar, t.deposit, t.monthly_rent, t.floor,
+                   t.deal_year, t.deal_month, t.deal_day
+            from estate.apt_rent t
+            <include refid="complexRentScope"/>
+        ),
+        agg as (
+            select pyeong,
+                   count(*)                  as rent_count,
+                   min(exclu_use_ar)         as area_min,
+                   max(exclu_use_ar)         as area_max
+            from rows group by pyeong
+        ),
+        latest as (
+            select distinct on (pyeong)
+                   pyeong,
+                   deposit                           as last_deposit,
+                   monthly_rent                      as last_monthly_rent,
+                   deal_year * 100 + deal_month      as last_ym,
+                   floor                             as last_floor
+            from rows
+            order by pyeong, deal_year desc, deal_month desc, deal_day desc
+        )
+        select a.pyeong,
+               0                as deal_count,
+               a.rent_count,
+               null::numeric    as avg_amount,
+               a.area_min, a.area_max,
+               l.last_deposit, l.last_monthly_rent, l.last_ym, l.last_floor
         from agg a join latest l on l.pyeong = a.pyeong
         order by a.pyeong
     </select>
@@ -733,5 +808,36 @@
         having count(*) &gt;= 10
         order by avg_amount desc
         limit #{limit}
+    </select>
+    <!--
+      전국 단지 이름 색인 — 검색창이 쓰는 원본.
+
+      **거래 표(apt_trade)가 아니라 단지 표(apt_complex)를 읽는다.** 거래 표는 990만 행이고
+      apt_seq 에 인덱스가 없어 전국 이름 검색을 할 수 없다. 단지 표는 44,616 행뿐이고
+      좌표까지 들고 있어(98.8%) 고른 단지로 지도를 바로 옮길 수 있다.
+
+      **한 번에 전부 읽는다.** 이 표는 geom/boundary 가 들어 있어 행이 넓고(약 36,000 페이지),
+      이름 부분검색(ilike '%..%')은 인덱스를 못 타 전수 조회가 된다 — 실측 944ms.
+      그래서 키를 쳐 넣을 때마다 DB 를 때리지 않고 서비스가 **메모리에 색인을 두고** 찾는다
+       (6시간 캐시, 약 7MB). 더 빠르게 하려면 trigram 인덱스를 두면 되지만 지금은 필요 없다.
+
+      시군구 이름은 여기서 조인한다 — 같은 이름의 단지가 많아(36,168 / 44,616) 화면에서
+      지역으로 구분해야 하기 때문이다.
+    -->
+    <select id="selectComplexNameIndex" resultType="map">
+        select c.apt_seq,
+               c.apt_nm,
+               c.sgg_cd,
+               coalesce(g.sgg_nm, c.sgg_cd) as sgg_nm,
+               c.umd_nm,
+               c.jibun,
+               c.build_year,
+               c.lon,
+               c.lat,
+               coalesce(c.trade_count, 0) as trade_count,
+               coalesce(c.rent_count, 0)  as rent_count
+        from estate.apt_complex c
+        left join public.g_sgg g on g.sgg_cd = c.sgg_cd
+        where c.apt_nm is not null and c.apt_nm != ''
     </select>
 </mapper>

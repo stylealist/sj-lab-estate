@@ -280,6 +280,28 @@ public class EstateService {
      * 되게 하는 것이 이 메서드의 목적이다. 별도 스레드로 돌려 기동을 늦추지 않고, DB 접속 정보가
      * 없거나 권한이 없으면 조용히 건너뛴다(그 상태는 /estate/status 가 알려 준다).
      */
+    /**
+     * 검색창이 쓰는 단지 색인을 기동 직후 올린다. **지역 예열과 따로, 자기 스레드에서** 돈다.
+     *
+     * <p>처음에는 {@link #warmUpRegions()} 안에 순서대로 넣었는데, 그 앞의 지역 목록 예열이
+     * 27초를 먹어 색인 차례가 너무 늦게 왔다(2026-11-17 실측). 그 사이에 검색한 사람이
+     * 13초를 기다리는 것을 로그로 확인했다 — 색인 적재가 예열 스레드가 아니라 **요청 스레드**에서
+     * 돌았다. 그래서 둘을 떼어 나란히 돌린다.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void warmUpComplexIndex() {
+        Thread worker = new Thread(() -> {
+            try {
+                long started = System.currentTimeMillis();
+                int count = complexIndex().size();
+                log.info("단지 검색 색인 예열 완료: {}개 ({}ms)", count, System.currentTimeMillis() - started);
+            } catch (Exception e) {
+                log.info("단지 검색 색인 예열 건너뜀: {}", e.getClass().getSimpleName());
+            }
+        }, "estate-complex-index-warmup");
+        worker.setDaemon(true);
+        worker.start();
+    }
     @EventListener(ApplicationReadyEvent.class)
     public void warmUpRegions() {
         Thread worker = new Thread(() -> {
@@ -852,20 +874,254 @@ public class EstateService {
         return aptSeq.substring(0, 5);
     }
 
+    // ── 전국 단지 검색 ──────────────────────────────────────────────────────
+    //
+    // 화면 헤더의 검색창이 쓴다. 종전에는 **시군구를 먼저 골라야** 단지를 찾을 수 있었다
+    // (`/complexes` 는 sggCd 가 필수다). "래미안" 처럼 이름만 아는 경우를 받지 못했다.
+    //
+    // **DB 를 매번 때리지 않고 메모리 색인에서 찾는다.** 단지 표는 geom/boundary 가 들어 있어
+    // 행이 넓고, 이름 부분검색은 인덱스를 못 타 전수 조회가 된다 — 실측 944ms. 키를 칠 때마다
+    // 1초가 걸리면 검색창으로 쓸 수 없다. 표가 44,616행뿐이라 전부 올려도 약 7MB 다.
+    //
+    // 더 빠르게 하려면 trigram 인덱스를 두면 되지만(수 MB) 지금은 필요 없다.
+
+    /** 단지 색인 수명. 수집이 돌 때만 바뀌는 값이라 몇 시간 뒤처져도 문제가 없다. */
+    private static final Duration COMPLEX_INDEX_TTL = Duration.ofHours(6);
+
+    /** 검색 결과 기본·최대 개수. */
+    private static final int COMPLEX_SEARCH_DEFAULT = 20;
+    private static final int COMPLEX_SEARCH_MAX = 50;
+
+    private volatile List<ComplexEntry> cachedComplexIndex;
+    private volatile Instant complexIndexLoadedAt;
+    private final java.util.concurrent.atomic.AtomicBoolean complexIndexRefreshing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 색인 한 줄. 검색할 때마다 이름을 다시 다듬지 않도록 **다듬은 이름을 미리 들고 있는다.**
+     */
+    private static final class ComplexEntry {
+        private final String aptSeq;
+        private final String aptNm;
+        private final String normalized;   // 공백 제거 + 소문자
+        private final String sggCd;
+        private final String sggNm;
+        private final String umdNm;
+        private final String jibun;
+        private final Integer buildYear;
+        private final Double lon;
+        private final Double lat;
+        private final int dealCount;       // 매매 + 전월세 건수(인기 순서용)
+        private final int tradeCount;      // 매매만 — 0 이면 화면이 "전월세만 있는 단지" 임을 미리 알린다
+        private final int rentCount;       // 전월세만
+
+        private ComplexEntry(Map<String, Object> row) {
+            this.aptSeq = str(row.get("apt_seq"));
+            this.aptNm = str(row.get("apt_nm"));
+            this.normalized = normalizeName(this.aptNm);
+            this.sggCd = str(row.get("sgg_cd"));
+            this.sggNm = str(row.get("sgg_nm"));
+            this.umdNm = str(row.get("umd_nm"));
+            this.jibun = str(row.get("jibun"));
+            this.buildYear = intOrNull(row.get("build_year"));
+            this.lon = dblOrNull(row.get("lon"));
+            this.lat = dblOrNull(row.get("lat"));
+            this.tradeCount = zero(row.get("trade_count"));
+            this.rentCount = zero(row.get("rent_count"));
+            this.dealCount = this.tradeCount + this.rentCount;
+        }
+
+        private static String str(Object o) { return o == null ? null : String.valueOf(o); }
+        private static Integer intOrNull(Object o) {
+            return (o instanceof Number n) ? n.intValue() : null;
+        }
+        private static Double dblOrNull(Object o) {
+            return (o instanceof Number n) ? n.doubleValue() : null;
+        }
+        private static int zero(Object o) { return (o instanceof Number n) ? n.intValue() : 0; }
+
+        private boolean hasCoords() { return lon != null && lat != null; }
+
+        /** 응답 한 줄. **키는 DB 컬럼명 그대로** 둔다(이 서비스의 규칙). */
+        private Map<String, Object> toRow() {
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("apt_seq", aptSeq);
+            m.put("apt_nm", aptNm);
+            m.put("sgg_cd", sggCd);
+            m.put("sgg_nm", sggNm);
+            m.put("umd_nm", umdNm);
+            m.put("jibun", jibun);
+            m.put("build_year", buildYear);
+            m.put("lon", lon);
+            m.put("lat", lat);
+            m.put("deal_count", dealCount);
+            // 매매·전월세를 따로도 준다 — 매매가 0 인 단지(3,053개)는 화면이 그 사실을 미리 알린다
+            m.put("trade_count", tradeCount);
+            m.put("rent_count", rentCount);
+            return m;
+        }
+    }
+
+    /**
+     * 이름 다듬기 — 공백을 빼고 소문자로 만든다.
+     *
+     * <p>"래미안 퍼스티지" 와 "래미안퍼스티지" 가 같게 찾히도록 하는 것이 목적이다.
+     * 원천 단지명에는 공백이 들쭉날쭉 들어 있다. 영문 단지명("e편한세상")도 있어 소문자로 맞춘다.
+     */
+    private static String normalizeName(String name) {
+        if (name == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (!Character.isWhitespace(c)) {
+                sb.append(Character.toLowerCase(c));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 전국 단지 검색. 이름 일부로 찾고 **거래가 많은 단지를 먼저** 보여 준다.
+     *
+     * <p>순서 규칙 — ① 이름이 정확히 같음 ② 이름이 그 글자로 시작 ③ 이름 안에 포함.
+     * 같은 순위 안에서는 **좌표가 있는 단지가 먼저**(좌표가 없으면 지도를 옮길 수 없다),
+     * 그다음 거래가 많은 순이다. 같은 이름의 단지가 많아(36,168 / 44,616) 응답에 시군구·읍면동을
+     * 함께 담아 화면이 구분해 보여 준다.
+     */
+    public List<Map<String, Object>> searchComplexes(String keyword, int limit) {
+        String q = normalizeName(keyword);
+        if (q.length() < 2) {
+            return List.of();
+        }
+        int size = Math.max(1, Math.min(limit, COMPLEX_SEARCH_MAX));
+
+        List<ComplexEntry> index = complexIndex();
+        List<ComplexEntry> hits = new ArrayList<>();
+        for (ComplexEntry e : index) {
+            if (e.normalized.contains(q)) {
+                hits.add(e);
+            }
+        }
+        hits.sort((a, b) -> {
+            int ra = rank(a.normalized, q);
+            int rb = rank(b.normalized, q);
+            if (ra != rb) {
+                return Integer.compare(ra, rb);
+            }
+            if (a.hasCoords() != b.hasCoords()) {
+                return a.hasCoords() ? -1 : 1;
+            }
+            if (a.dealCount != b.dealCount) {
+                return Integer.compare(b.dealCount, a.dealCount);
+            }
+            return a.aptNm == null ? 0 : a.aptNm.compareTo(b.aptNm == null ? "" : b.aptNm);
+        });
+
+        List<Map<String, Object>> out = new ArrayList<>(Math.min(size, hits.size()));
+        for (int i = 0; i < hits.size() && out.size() < size; i++) {
+            out.add(hits.get(i).toRow());
+        }
+        return out;
+    }
+
+    /** 0 = 정확히 같음, 1 = 그 글자로 시작, 2 = 안에 포함. */
+    private static int rank(String name, String q) {
+        if (name.equals(q)) {
+            return 0;
+        }
+        return name.startsWith(q) ? 1 : 2;
+    }
+
+    /**
+     * 색인을 돌려준다. 기한이 지났으면 **가진 값을 바로 주고 갱신은 뒤에서** 한다
+     * (지역 목록과 같은 방식) — 만료된 순간에 들어온 사람만 1초를 기다리는 일이 없게 한다.
+     */
+    private List<ComplexEntry> complexIndex() {
+        List<ComplexEntry> cached = cachedComplexIndex;
+        Instant loadedAt = complexIndexLoadedAt;
+        boolean fresh = cached != null && loadedAt != null
+                && Instant.now().isBefore(loadedAt.plus(COMPLEX_INDEX_TTL));
+        if (fresh) {
+            return cached;
+        }
+        if (cached != null) {
+            refreshComplexIndexInBackground();
+            return cached;
+        }
+        return loadComplexIndex();
+    }
+
+    private void refreshComplexIndexInBackground() {
+        if (!complexIndexRefreshing.compareAndSet(false, true)) {
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            try {
+                loadComplexIndex();
+            } catch (Exception e) {
+                log.warn("단지 색인 갱신 실패 — 이전 값을 계속 사용한다: {}", e.getClass().getSimpleName());
+            } finally {
+                complexIndexRefreshing.set(false);
+            }
+        }, "estate-complex-index-refresh");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private synchronized List<ComplexEntry> loadComplexIndex() {
+        List<ComplexEntry> cached = cachedComplexIndex;
+        Instant loadedAt = complexIndexLoadedAt;
+        if (cached != null && loadedAt != null
+                && Instant.now().isBefore(loadedAt.plus(COMPLEX_INDEX_TTL))) {
+            return cached;   // 기다리는 동안 다른 스레드가 이미 채웠다
+        }
+        long started = System.currentTimeMillis();
+        List<ComplexEntry> built = new ArrayList<>();
+        for (Map<String, Object> row : mapper().selectComplexNameIndex()) {
+            built.add(new ComplexEntry(row));
+        }
+        List<ComplexEntry> fixed = java.util.Collections.unmodifiableList(built);
+        cachedComplexIndex = fixed;
+        complexIndexLoadedAt = Instant.now();
+        log.info("단지 검색 색인 적재: {}개 ({}ms)", fixed.size(), System.currentTimeMillis() - started);
+        return fixed;
+    }
     public List<Map<String, Object>> getComplexes(String sggCd, String umdNm, String keyword, int limit) {
         return new ArrayList<>(mapper().selectComplexes(sggCd, umdNm, keyword, limit));
     }
 
-    /** 단지 기본 정보 + 평형별 요약을 한 번에 돌려준다(화면이 둘을 함께 쓰기 때문). */
+    /**
+     * 단지 기본 정보 + 평형별 요약을 한 번에 돌려준다(화면이 둘을 함께 쓰기 때문).
+     *
+     * <p><b>매매가 없으면 전월세 표에서 만든다</b>(2026-11-17). 단지 표 44,616개 중
+     * <b>3,053개(6.8%)는 전월세 거래만 있다</b>(실측). 매매 표만 보고 비면 그 단지는
+     * "없는 단지"가 되어 상세가 <b>404</b> 였다 — 전국 검색으로 고를 수 있게 되자 바로 드러났다
+     * (예: 서대문구 연희동 덕운포레스트힐 `11410-3674`, 전월세 65건·매매 0건).
+     *
+     * <p>응답은 **키를 똑같이** 맞추고 어느 쪽에서 만들었는지만 `trade_available` 로 알린다
+     * (화면이 매매 탭을 먼저 펴지 않고 "매매 거래가 없다"고 적는 데 쓴다). 거래가 아예 없으면
+     * 그때는 빈 값을 돌려주고 컨트롤러가 404 로 답한다.
+     */
     public Map<String, Object> getComplexDetail(String aptSeq, String umdNm) {
         EstateMapper mapper = mapper();
         String sggCd = sggCdOf(aptSeq);
         Map<String, Object> summary = mapper.selectComplexSummary(sggCd, aptSeq, umdNm);
-        if (summary == null || summary.isEmpty()) {
-            return Map.of();
+        boolean tradeAvailable = summary != null && !summary.isEmpty();
+        if (!tradeAvailable) {
+            summary = mapper.selectComplexRentSummary(sggCd, aptSeq, umdNm);
+            if (summary == null || summary.isEmpty()) {
+                return Map.of();
+            }
         }
         Map<String, Object> result = new LinkedHashMap<>(summary);
-        result.put("areas", mapper.selectComplexAreas(sggCd, aptSeq, umdNm));
+        result.put("trade_available", tradeAvailable);
+        result.put(
+                "areas",
+                tradeAvailable
+                        ? mapper.selectComplexAreas(sggCd, aptSeq, umdNm)
+                        : mapper.selectComplexRentAreas(sggCd, aptSeq, umdNm));
         return result;
     }
 
