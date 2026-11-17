@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -52,6 +53,21 @@ public class EstateExceptionHandler {
     @ExceptionHandler({MethodArgumentTypeMismatchException.class, MethodArgumentNotValidException.class})
     public ResponseEntity<Map<String, Object>> handleTypeMismatch(Exception e) {
         return body(HttpStatus.BAD_REQUEST, "INVALID_PARAMETER", "파라미터 형식이 올바르지 않습니다.");
+    }
+
+    /**
+     * 필수 파라미터를 아예 보내지 않은 경우.
+     *
+     * <p>이것을 따로 받지 않으면 맨 아래 포괄 처리로 떨어져 <b>502 QUERY_FAILED</b> 가 된다 —
+     * 부르는 쪽 잘못인데 "서버가 조회에 실패했다"로 보여 원인을 찾기 어렵다(2026-11-17 운영
+     * 확인 중 발견: `/complexes/search` 를 `q` 없이 부르면 502 였다). 빈 값으로 보낸 경우는
+     * 컨트롤러가 이미 같은 코드(`MISSING_PARAMETER`)로 400 을 낸다 — 둘을 같게 맞춘다.
+     */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    public ResponseEntity<Map<String, Object>> handleMissingParam(
+            MissingServletRequestParameterException e) {
+        return body(
+                HttpStatus.BAD_REQUEST, "MISSING_PARAMETER", e.getParameterName() + " 는 필수입니다.");
     }
 
     @ExceptionHandler(Exception.class)
