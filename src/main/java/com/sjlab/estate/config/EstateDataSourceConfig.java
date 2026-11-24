@@ -6,6 +6,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 
 /**
  * 부동산 DB 접속.
@@ -31,6 +32,9 @@ public class EstateDataSourceConfig {
     // 빈 문자열이면 만들지 않는다. @ConditionalOnProperty 는 "값이 빈 문자열"도 있는 것으로 보기 때문에
     // 식으로 비교한다(환경변수를 안 주면 application.yml 기본값이 빈 문자열이다).
     @ConditionalOnExpression("'${estate.datasource.url:}' != ''")
+    // 회원 데이터용 두 번째 DataSource(`MemberDataSourceConfig`)가 생기면서 후보가 둘이 됐다.
+    // **MyBatis 자동설정은 이쪽(실거래)을 써야** 한다 — 떼면 매퍼가 어느 쪽에 붙을지 알 수 없다.
+    @Primary
     public DataSource estateDataSource() {
         HikariDataSource dataSource = new HikariDataSource();
         dataSource.setJdbcUrl(url);
@@ -48,6 +52,19 @@ public class EstateDataSourceConfig {
         dataSource.setMaxLifetime(600_000);
         dataSource.setValidationTimeout(3_000);
         return dataSource;
+    }
+
+    // 회원용 두 번째 풀(`MemberDataSourceConfig`)이 같은 접속 정보를 쓰려고 읽어 간다.
+    public String getUrl() {
+        return url;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public String getPassword() {
+        return password;
     }
 
     public void setUrl(String url) {

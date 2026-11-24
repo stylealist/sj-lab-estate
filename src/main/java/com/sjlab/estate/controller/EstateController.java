@@ -487,31 +487,49 @@ public class EstateController {
         return value;
     }
 
+    // 아래 예외들은 **public 이다**(2026-11-24). 회원 기능이 생기면서 `service`·`auth` 패키지에서도
+    // 같은 오류 형태를 써야 했다 — 패키지마다 비슷한 예외를 또 만들면 응답 형태가 갈라진다.
+
     /** 400 — 호출하는 쪽이 고쳐야 하는 입력. */
-    static class BadRequestException extends RuntimeException {
+    public static class BadRequestException extends RuntimeException {
         final String code;
 
-        BadRequestException(String code, String message) {
+        public BadRequestException(String code, String message) {
             super(message);
             this.code = code;
         }
     }
 
     /** 404 — 그런 단지가 없다(거래 기록이 없다). */
-    static class NotFoundException extends RuntimeException {
+    public static class NotFoundException extends RuntimeException {
         final String code;
 
-        NotFoundException(String code, String message) {
+        public NotFoundException(String code, String message) {
             super(message);
             this.code = code;
         }
     }
 
-    /** 503 — 서버가 아직 준비되지 않은 상태(준비 중인 매물 종류 등). */
-    static class NotReadyException extends RuntimeException {
+    /** 503 — 서버가 아직 준비되지 않은 상태(준비 중인 매물 종류, 회원 표 미생성 등). */
+    public static class NotReadyException extends RuntimeException {
         final String code;
 
-        NotReadyException(String code, String message) {
+        public NotReadyException(String code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    /**
+     * 401 — 로그인이 필요하거나 토큰이 만료됐다.
+     *
+     * <p>회원 기능(즐겨찾기·메모)에만 쓴다. 조회 API 는 종전대로 로그인을 요구하지 않는다 —
+     * 지도와 시세는 로그인 없이 볼 수 있어야 한다.
+     */
+    public static class UnauthorizedException extends RuntimeException {
+        final String code;
+
+        public UnauthorizedException(String code, String message) {
             super(message);
             this.code = code;
         }

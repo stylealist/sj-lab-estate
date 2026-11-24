@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -44,6 +45,13 @@ public class EstateExceptionHandler {
         return body(HttpStatus.SERVICE_UNAVAILABLE, e.code, e.getMessage());
     }
 
+    /** 401 — 회원 기능에만 있다. 조회 API 는 로그인을 요구하지 않는다. */
+    @ExceptionHandler(EstateController.UnauthorizedException.class)
+    public ResponseEntity<Map<String, Object>> handleUnauthorized(
+            EstateController.UnauthorizedException e) {
+        return body(HttpStatus.UNAUTHORIZED, e.code, e.getMessage());
+    }
+
     @ExceptionHandler(EstateService.EstateNotConfiguredException.class)
     public ResponseEntity<Map<String, Object>> handleNotConfigured(
             EstateService.EstateNotConfiguredException e) {
@@ -68,6 +76,22 @@ public class EstateExceptionHandler {
             MissingServletRequestParameterException e) {
         return body(
                 HttpStatus.BAD_REQUEST, "MISSING_PARAMETER", e.getParameterName() + " 는 필수입니다.");
+    }
+
+    /**
+     * 요청 본문(JSON)을 읽을 수 없는 경우 — 회원 기능의 POST·PUT 에만 해당한다.
+     *
+     * <p>따로 받지 않으면 맨 아래 포괄 처리로 떨어져 <b>502 QUERY_FAILED</b> 가 된다. 부르는 쪽이
+     * 본문을 잘못 보낸 것인데 "서버가 조회에 실패했다"로 보여 원인을 찾기 어렵다 — `q` 누락이
+     * 502 였던 것(2026-11-17)과 같은 종류의 문제다. 실제로 UTF-8 이 아닌 본문을 보내 보고 확인했다
+     * (2026-11-24, 한글 메모를 CP949 로 보낸 경우).
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Map<String, Object>> handleUnreadableBody(HttpMessageNotReadableException e) {
+        return body(
+                HttpStatus.BAD_REQUEST,
+                "INVALID_BODY",
+                "요청 본문을 읽을 수 없습니다. JSON 형식과 UTF-8 인코딩을 확인해 주세요.");
     }
 
     @ExceptionHandler(Exception.class)
