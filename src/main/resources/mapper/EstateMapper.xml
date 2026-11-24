@@ -377,11 +377,18 @@
     <select id="selectComplexPins" resultType="string">
         with picked as (
             select c.apt_seq, c.apt_nm, c.sgg_cd, c.umd_nm, c.jibun, c.build_year,
-                   c.lon, c.lat, c.trade_count
+                   c.lon, c.lat, c.trade_count, c.rent_count,
+                   <!--
+                     **고를 때 전월세 건수까지 센다**(2026-11-24). 종전에는 `trade_count desc` 로만
+                     골랐는데, 전월세만 있는 단지는 `trade_count = 0` 이라 **항상 꼴찌**였다 —
+                     단지가 limit 보다 많은 도심에서는 잘려 나가 지도에 뜰 기회가 없었다.
+                     두 값의 합은 전국 검색의 인기 순서(`deal_count`)와 같은 기준이다.
+                   -->
+                   c.trade_count + c.rent_count as activity_count
             from estate.apt_complex c
             where c.geom is not null
               and ST_Intersects(c.geom, ST_MakeEnvelope(#{minX}, #{minY}, #{maxX}, #{maxY}, 3857))
-            order by c.trade_count desc
+            order by c.trade_count + c.rent_count desc
             limit #{limit}
         ),
         <!--
@@ -434,6 +441,71 @@
                    round(avg_amount) as main_avg_amount
             from byPyeong
             order by apt_seq, cnt desc, pyeong
+        ),
+        <!--
+          ─── 전월세만 있는 단지 (2026-11-24) ───────────────────────────────────────
+          단지 표 44,616개 중 **3,053개(6.8%)는 전월세 거래만** 있다. 위의 집계는 매매 표만
+          보므로 그 단지들은 `summed` 가 비어 **지도에서 아예 사라졌다**(상세는 2026-11-17 에
+          열어 뒀는데 핀이 없어 들어갈 길이 전국 검색뿐이었다).
+
+          **전월세 표를 전체 단지에 조인하지 말 것.** 화면에 뜨는 단지 전부(최대 300개)에 대고
+          전월세를 묶으면 매매와 똑같은 크기의 조인이 하나 더 붙는다. 전월세 집계가 **필요한
+          단지는 6.8% 뿐**이므로, `trade_count = 0`(단지 표가 들고 있는 누적 건수)인 것만 골라
+          그 몇 개에만 조인한다 — 보통 한 화면에 0~20개다.
+
+          조인은 매매와 같은 이유로 **자연키**로 한다(`ux_apt_rent_natural` 의 앞머리가
+          `sgg_cd, umd_nm, jibun, apt_nm` 이다). `apt_seq in (...)` 로 묻지 말 것.
+        -->
+        rentPicked as (
+            select p.apt_seq, p.sgg_cd, p.umd_nm, p.jibun, p.apt_nm
+            from picked p
+            where p.trade_count = 0
+              and p.rent_count &gt; 0
+        ),
+        rentByPyeong as (
+            select p.apt_seq,
+                   round(r.exclu_use_ar / 3.3058 / 0.75)::int                     as pyeong,
+                   count(*)                                                       as cnt,
+                   <!-- 전세·월세를 가르는 기준은 `monthly_rent = 0` 이다(프로젝트 공통 규칙). -->
+                   count(*) filter (where r.monthly_rent = 0)                     as jeonse_cnt,
+                   avg(r.deposit) filter (where r.monthly_rent = 0)               as jeonse_deposit,
+                   avg(r.deposit) filter (where r.monthly_rent &gt; 0)            as wolse_deposit,
+                   avg(r.monthly_rent) filter (where r.monthly_rent &gt; 0)       as wolse_monthly,
+                   min(r.exclu_use_ar)                                            as area_min,
+                   max(r.exclu_use_ar)                                            as area_max
+            from rentPicked p
+            join estate.apt_rent r
+              on r.sgg_cd = p.sgg_cd
+             and r.umd_nm = p.umd_nm
+             and r.jibun  = p.jibun
+             and r.apt_nm = p.apt_nm
+            where r.deposit is not null
+            <include refid="ymFilter"><property name="alias" value="r."/></include>
+            group by p.apt_seq, 2
+        ),
+        rentSummed as (
+            select apt_seq,
+                   sum(cnt)                as rent_count,
+                   round(min(area_min), 1) as area_min,
+                   round(max(area_max), 1) as area_max
+            from rentByPyeong
+            group by apt_seq
+        ),
+        rentMain as (
+            select distinct on (apt_seq)
+                   apt_seq,
+                   pyeong as main_pyeong,
+                   cnt    as main_rent_count,
+                   <!--
+                     마커에 적을 금액 한 개를 고른다. 전세가 한 건이라도 있으면 **전세 보증금**을
+                     쓰고(사람들이 먼저 보는 값이다), 월세뿐인 단지에서는 월세의 보증금을 쓴다.
+                     전세가 있는데 월세까지 함께 적으면 두 금액이 섞여 읽히지 않으므로 그때는
+                     월세를 비운다.
+                   -->
+                   round(coalesce(jeonse_deposit, wolse_deposit))                        as main_deposit,
+                   case when jeonse_cnt &gt; 0 then null else round(wolse_monthly) end as main_monthly_rent
+            from rentByPyeong
+            order by apt_seq, cnt desc, pyeong
         )
         <!--
           **철거된 옛 단지를 지도에서 뺀다**(2026-10-22). 재건축이 끝난 자리에는 옛 단지와 새 단지가
@@ -441,7 +513,8 @@
           뽑히니 거래가 쌓인 **옛 단지가 이긴다**. 게다가 영역·좌표는 지금 서 있는 건물로 받으므로
           새 아파트 자리에 옛 이름이 붙어 보인다 — 사용자가 바로 이 상태를 지적했다.
 
-          방법은 **"고른 기간에 거래가 있는 단지만" 올리는 것**이다(summed 를 inner join).
+          방법은 **"고른 기간에 거래가 있는 단지만" 올리는 것**이다(2026-11-24 부터는 매매 또는
+          전월세. 아래 `where` 의 `s.apt_seq is not null or rs.apt_seq is not null`).
           거래 표를 **더 읽지 않으므로 공짜**다 — "최근 5년" 같은 별도 조건을 달면 거래 표를
           5년치 다시 읽어 **핀 조회가 0.3초 → 36초**가 된다(2026-10-22 실측, 그래서 되돌렸다).
         -->
@@ -466,16 +539,37 @@
                      'deal_count', s.deal_count,
                      'avg_amount', s.avg_amount,
                      'avg_amount_per_m2', s.avg_amount_per_m2,
-                     'area_min', s.area_min,
-                     'area_max', s.area_max,
-                     'main_pyeong', m.main_pyeong,
+                     <!-- 면적·대표 평형은 **매매가 없으면 전월세 쪽 값**으로 채운다 —
+                          화면이 두 갈래 코드를 들지 않게 키 이름을 그대로 쓴다. -->
+                     'area_min', coalesce(s.area_min, rs.area_min),
+                     'area_max', coalesce(s.area_max, rs.area_max),
+                     'main_pyeong', coalesce(m.main_pyeong, rm.main_pyeong),
                      'main_deal_count', m.main_deal_count,
-                     'main_avg_amount', m.main_avg_amount))
-                 order by p.trade_count desc), '[]')::text
+                     'main_avg_amount', m.main_avg_amount,
+                     <!--
+                       **매매가 있는 단지인지**(2026-11-24). 상세 API(`/complexes/{aptSeq}`)와
+                       **같은 키 이름·같은 뜻**이라 화면이 한 가지 분기만 들면 된다.
+                       아래 네 값은 `trade_available = false` 인 단지에만 들어온다.
+                     -->
+                     'trade_available', s.apt_seq is not null,
+                     'rent_count', rs.rent_count,
+                     'main_rent_count', rm.main_rent_count,
+                     'main_deposit', rm.main_deposit,
+                     'main_monthly_rent', rm.main_monthly_rent))
+                 order by p.activity_count desc), '[]')::text
         from picked p
-        join summed s on s.apt_seq = p.apt_seq
+        left join summed s on s.apt_seq = p.apt_seq
         left join mainPyeong m on m.apt_seq = p.apt_seq
+        left join rentSummed rs on rs.apt_seq = p.apt_seq
+        left join rentMain rm on rm.apt_seq = p.apt_seq
         where p.lon is not null and p.lat is not null
+          <!--
+            **"고른 기간에 거래가 있는 단지만" 올린다는 규칙은 그대로다** — 매매가 아니면
+            전월세로 확인한다. 둘 다 비면(철거된 옛 단지가 대표적) 핀에 올리지 않는다.
+            `join summed` 를 `left join` 으로 바꿨으니 이 조건을 지우지 말 것 — 지우면
+            철거 단지가 다시 올라온다.
+          -->
+          and (s.apt_seq is not null or rs.apt_seq is not null)
     </select>
 
     <!--
