@@ -90,6 +90,47 @@ public class MemberController {
         return memberService.removeFavorite(authClient.requireUsername(auth), aptSeq);
     }
 
+    /**
+     * 목표가를 정해 둔 관심 단지만 — 지도·팝업의 🔔 표시용(2026-11-25).
+     *
+     * <p>목록 전체(`/favorites`)는 단지마다 거래를 세는 무거운 질의라 화면을 열 때마다 부를 수
+     * 없다. 이쪽은 <b>목표가를 정한 단지만</b> 보므로, 하나도 안 정했으면 행이 0개라 그 집계가
+     * 아예 돌지 않는다.
+     */
+    @GetMapping("/favorites/targets")
+    public Map<String, Object> favoriteTargets(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String auth) {
+        return Map.of("items", memberService.listTargets(authClient.requireUsername(auth)));
+    }
+
+    /**
+     * 목표가를 정하거나 고친다. <b>금액을 비우면 지운다</b>(메모와 같은 규칙).
+     *
+     * <p>본문: {@code {amount, kind, dir, pyeong}} — 금액은 <b>만원</b> 단위(이 서비스 공통),
+     * {@code kind} 는 {@code trade}·{@code jeonse}, {@code dir} 는 {@code below}·{@code above},
+     * {@code pyeong} 은 분양 평형(비우면 모든 평형).
+     */
+    @PutMapping("/favorites/{aptSeq}/target")
+    public Map<String, Object> setTarget(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String auth,
+            @PathVariable String aptSeq,
+            @RequestBody(required = false) Map<String, Object> body) {
+        return memberService.setTarget(
+                authClient.requireUsername(auth),
+                aptSeq,
+                number(body, "amount"),
+                text(body, "kind", null),
+                text(body, "dir", null),
+                number(body, "pyeong"));
+    }
+
+    @DeleteMapping("/favorites/{aptSeq}/target")
+    public Map<String, Object> clearTarget(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String auth,
+            @PathVariable String aptSeq) {
+        return memberService.setTarget(authClient.requireUsername(auth), aptSeq, null, null, null, null);
+    }
+
     /** "새 거래" 표시를 지운다(그 단지를 열어 봤다는 뜻). */
     @PostMapping("/favorites/{aptSeq}/seen")
     public Map<String, Object> markSeen(
@@ -166,6 +207,34 @@ public class MemberController {
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String auth,
             @PathVariable String aptSeq) {
         return memberService.saveNote(authClient.requireUsername(auth), "apt", aptSeq, "");
+    }
+
+    /**
+     * 본문에서 숫자를 꺼낸다. <b>화면이 문자열로 보내도 받는다</b> — 입력칸 값은 문자열이라
+     * 숫자로 바꾸는 것을 깜빡하면 조용히 null 이 되어 "지우기" 로 동작한다(찾기 어려운 버그다).
+     * 숫자로 읽을 수 없으면 400 으로 분명히 알린다.
+     */
+    private Integer number(Map<String, Object> body, String key) {
+        if (body == null) {
+            return null;
+        }
+        Object value = body.get(key);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        String text = String.valueOf(value).trim().replace(",", "");
+        if (text.isEmpty()) {
+            return null;
+        }
+        try {
+            return (int) Math.round(Double.parseDouble(text));
+        } catch (NumberFormatException e) {
+            throw new EstateController.BadRequestException(
+                    "INVALID_NUMBER", "숫자로 읽을 수 없는 값입니다: " + key);
+        }
     }
 
     private String text(Map<String, Object> body, String key, String fallback) {

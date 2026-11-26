@@ -28,6 +28,23 @@ estate:
     # estate-pool total=5 active=5). 조회 전용이라 넉넉히 둔다.
     pool-size: ${ESTATE_DB_POOL_SIZE:16}
 
+  kakao:
+    # 카카오톡 "나에게 보내기" — 목표가에 닿으면 알린다.
+    # **저장소가 public 이라 키는 환경변수로만 받는다.** 값이 없으면 이 기능만 꺼지고
+    # (화면이 연결 단추를 숨긴다) 나머지는 그대로 돈다.
+    rest-api-key: ${KAKAO_REST_API_KEY:}
+    # 카카오 개발자 화면에서 "보안 - Client Secret" 을 켰을 때만 필요하다(안 켰으면 비워 둔다).
+    client-secret: ${KAKAO_CLIENT_SECRET:}
+    # 동의 화면을 어떻게 띄울지. login = 세션이 있어도 로그인 화면을 다시 거친다(기본값).
+    # select_account = 계정 고르기, 빈 값 = 카카오에 맡김(이미 동의했으면 곧바로 돌아온다).
+    prompt: ${KAKAO_PROMPT:login}
+    # 메시지의 단추가 열 주소. 로컬에서 시험할 때는 http://localhost:4200/ 로 바꾼다.
+    site-url: ${KAKAO_SITE_URL:https://sj-lab.co.kr/estate/}
+    # 감시 주기(ms). 기본 30분 — 수집이 끝나는 시각이 일정하지 않아 간격으로 훑는다.
+    # 조건이 "연결한 사람 × 목표가를 정한 단지 × 아직 안 알린 도달" 이라 평소에는 행이 0개다.
+    watch-interval-ms: ${KAKAO_WATCH_INTERVAL_MS:1800000}
+    watch-initial-delay-ms: ${KAKAO_WATCH_INITIAL_DELAY_MS:60000}
+
 mybatis:
   mapper-locations: classpath:mapper/*.xml
   configuration:

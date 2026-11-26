@@ -5,6 +5,7 @@ import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * sj-lab 부동산 실거래 조회 서비스.
@@ -16,8 +17,11 @@ import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
 // DataSource 는 EstateDataSourceConfig 가 접속 정보가 있을 때만 만든다.
 // 스프링 기본 자동설정을 켜 두면 접속 정보가 없을 때 "드라이버를 찾을 수 없다"며
 // 기동 자체가 실패해, 화면이 '준비되지 않았다'조차 받을 수 없다.
+// 목표가 카카오 알림이 일정 간격으로 "아직 안 알린 도달" 을 훑는다(2026-11-26).
+// 켜 두어도 카카오 키·표가 없으면 그 작업이 첫 줄에서 바로 되돌아오므로 비용이 없다.
 @SpringBootApplication(exclude = {DataSourceAutoConfiguration.class, DataSourceTransactionManagerAutoConfiguration.class})
 @EnableDiscoveryClient
+@EnableScheduling
 public class EstateApplication {
 
     public static void main(String[] args) {

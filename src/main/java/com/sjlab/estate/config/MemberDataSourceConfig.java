@@ -68,8 +68,20 @@ public class MemberDataSourceConfig {
             @org.springframework.beans.factory.annotation.Qualifier("estateMemberDataSource")
                     DataSource memberDataSource) {
         JdbcTemplate jdbcTemplate = new JdbcTemplate(memberDataSource);
-        // 회원 질의는 모두 작다. 오래 걸리면 무언가 잘못된 것이므로 기다리지 않고 끊는다.
-        jdbcTemplate.setQueryTimeout(5);
+        /*
+          **5초로 두었더니 담기가 502 로 실패했다**(2026-11-26 실측).
+
+          "회원 질의는 모두 작다" 고 적어 두었는데 **사실이 아니다.** 담기·새 거래 표시 지우기·
+          목표가 저장은 문장 안에 <b>실거래를 뒤지는 조회</b>를 품고 있다("담는 순간의 최근
+          계약일"을 함께 적기 때문이다). 그 시군구를 처음 건드리면 매매·전월세 두 표를 각각
+          훑어 2초씩 걸리고(`apt_seq` 에 단독 인덱스가 없다), 찬 상태에서는 5초를 넘긴다 —
+          그때 DB 가 문장을 끊어 `canceling statement due to user request` 가 난다.
+
+          그래서 **15초**로 둔다. "오래 걸리면 끊는다" 는 뜻은 그대로 두되, 숫자를 실제 비용에
+          맞춘 것이다. 더 줄이려면 **문장을 나눠** 계약일은 실거래 풀(16개, 제한 없음)에서
+          먼저 읽고 회원 표에는 값만 넣으면 된다 — 그때 이 값을 다시 5초로 내릴 수 있다.
+        */
+        jdbcTemplate.setQueryTimeout(15);
         return jdbcTemplate;
     }
 
